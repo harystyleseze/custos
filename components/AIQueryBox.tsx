@@ -104,11 +104,12 @@ export default function AIQueryBox({ docId, documentText }: Props) {
 
         try {
             // Step 1: Semantic search (browser WASM)
+            // Use top 1 result for browser LLM (350 char limit), top 5 for Ollama
             const index = await ensureIndexed()
             const results = await searchDocuments(query, index, 5)
             const context = results.length > 0
-                ? results.map(r => r.chunk).join('\n\n---\n\n')
-                : documentText.slice(0, 2000)
+                ? results.map(r => r.chunk).join('\n')
+                : documentText.slice(0, 400)
 
             // Step 2: On-chain audit log (non-blocking)
             const queryHash = keccak256(toHex(`${query}:${Date.now()}`))
@@ -161,7 +162,7 @@ export default function AIQueryBox({ docId, documentText }: Props) {
                 {isLoading ? (
                     <>
                         {loadingStage === 'embeddings' && `Loading search model... ${loadProgress > 0 ? `${loadProgress}%` : '(~117MB, cached after first load)'}`}
-                        {loadingStage === 'llm' && `Loading inference model... ${loadProgress > 0 ? `${loadProgress}%` : '(~80MB, cached after first load)'}`}
+                        {loadingStage === 'llm' && `Loading AI models... ${loadProgress > 0 ? `${loadProgress}%` : '(~340MB total, cached after first load)'}`}
                     </>
                 ) : isReady ? (
                     <>
@@ -247,7 +248,7 @@ export default function AIQueryBox({ docId, documentText }: Props) {
 
             {/* Privacy note */}
             <div style={{ fontSize: 11, color: 'var(--text-dim)', borderTop: '1px solid var(--border)', paddingTop: 8 }}>
-                🔒 Zero-server AI: search (e5-small WASM) + inference (flan-t5-small WASM) run in your browser · Query hash logged as FHE audit on Sepolia
+                🔒 Zero-server AI: search (e5-small) + QA (distilbert) + generation (flan-t5) all run in your browser · Query hash logged as FHE audit on Sepolia
             </div>
         </div>
     )
