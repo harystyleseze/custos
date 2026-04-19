@@ -4,7 +4,7 @@ import { useState, useEffect, KeyboardEvent } from 'react'
 import { useWriteContract } from 'wagmi'
 import { keccak256, toHex } from 'viem'
 import { VAULT_ABI, VAULT_ADDRESS } from '@/lib/vault'
-import { searchDocuments, indexDocument, loadEmbeddingModel, type DocumentChunk, isModelLoaded } from '@/lib/embeddings'
+import { searchDocuments, indexDocument, assembleContext, loadEmbeddingModel, type DocumentChunk, isModelLoaded } from '@/lib/embeddings'
 import { loadBrowserLLM, isBrowserLLMLoaded, detectOllama, runInference, type InferenceBackend } from '@/lib/browser-llm'
 
 interface Message {
@@ -104,14 +104,20 @@ export default function AIQueryBox({ docId, documentText }: Props) {
 
         try {
             // Step 1: Semantic search (browser WASM)
-            // Use top 1 result for browser LLM (350 char limit), top 5 for Ollama
             const index = await ensureIndexed()
-            const results = await searchDocuments(query, index, 5)
-            const context = results.length > 0
-                ? results.map(r => r.chunk).join('\n')
-                : documentText.slice(0, 400)
+            const results = await searchDocuments(query, index, 3)
 
-            // Step 2: On-chain audit log (non-blocking)
+            // Step 2: Assemble context respecting token budget
+            const maxChars = ollamaModel ? 4000 : 350
+            const context = results.length > 0
+                ? assembleContext(results, index, maxChars)
+                : documentText.slice(0, 350)
+
+            // Step 3: Inference FIRST — user gets answer before MetaMask popup
+            const { answer, backend } = await runInference(query, context, ollamaModel)
+            setMessages(prev => [...prev, { role: 'assistant', content: answer, backend }])
+
+            // Step 4: Audit log AFTER answer shown (non-blocking)
             const queryHash = keccak256(toHex(`${query}:${Date.now()}`))
             writeContractAsync({
                 address: VAULT_ADDRESS,
@@ -120,10 +126,6 @@ export default function AIQueryBox({ docId, documentText }: Props) {
                 args: [docId, queryHash],
                 gas: 5_000_000n,
             }).catch(() => console.warn('[Custos] Audit log failed (non-blocking)'))
-
-            // Step 3: Inference (Ollama if available, otherwise browser LLM)
-            const { answer, backend } = await runInference(query, context, ollamaModel)
-            setMessages(prev => [...prev, { role: 'assistant', content: answer, backend }])
         } catch (e) {
             setMessages(prev => [...prev, {
                 role: 'assistant',
