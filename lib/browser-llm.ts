@@ -69,18 +69,29 @@ export function isBrowserLLMLoaded(): boolean {
 // Browser inference
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Detect hallucinated or garbage responses from flan-t5 */
+function isLowQualityAnswer(answer: string, query: string): boolean {
+    if (!answer || answer.length < 3) return true
+    // Brackets indicate template/placeholder output
+    if (/\[.*\]/.test(answer)) return true
+    // Answer is just the question echoed back
+    if (answer.toLowerCase().includes(query.toLowerCase())) return true
+    // Very generic non-answers
+    if (/^(the|a|an|this|it|yes|no)\s*\.?$/i.test(answer)) return true
+    return false
+}
+
 async function generateWithBrowser(query: string, context: string): Promise<string> {
     if (!genModel && !qaModel) throw new Error('Browser LLM not loaded')
 
     // Primary: generative model (flan-t5-small) — better at reasoning about context
-    // It can distinguish "deadline" from "opens" date, understand categories, etc.
     if (genModel) {
         const shortCtx = context.slice(0, 350)
-        const prompt = `Answer the question based only on the context below.\nContext: ${shortCtx}\nQuestion: ${query}\nAnswer:`
+        const prompt = `Read the context and give a clear, complete answer to the question. Do not copy headings or labels from the context.\n\nContext: ${shortCtx}\n\nQuestion: ${query}\n\nAnswer:`
         const genResult = await genModel(prompt, { max_new_tokens: 150, do_sample: false })
         const answer = genResult[0]?.generated_text?.trim()
         console.log('[Custos] Generative answer:', answer)
-        if (answer && answer.length > 2) return answer
+        if (answer && !isLowQualityAnswer(answer, query)) return answer
     }
 
     // Fallback: extractive QA (distilbert) — good for simple span extraction
@@ -92,7 +103,7 @@ async function generateWithBrowser(query: string, context: string): Promise<stri
         }
     }
 
-    return 'I could not find a clear answer in the document. Try rephrasing as a specific question.'
+    return 'I couldn\'t find a specific answer for that. Try asking a more specific question, like "What is the deadline?" or "What are the eligibility requirements?"'
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

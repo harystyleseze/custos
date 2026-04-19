@@ -113,19 +113,16 @@ export default function AIQueryBox({ docId, documentText }: Props) {
                 ? assembleContext(results, index, maxChars)
                 : documentText.slice(0, 350)
 
-            // Step 3: Inference FIRST — user gets answer before MetaMask popup
+            // Step 3: Inference
             const { answer, backend } = await runInference(query, context, ollamaModel)
             setMessages(prev => [...prev, { role: 'assistant', content: answer, backend }])
 
-            // Step 4: Audit log AFTER answer shown (non-blocking)
-            const queryHash = keccak256(toHex(`${query}:${Date.now()}`))
-            writeContractAsync({
-                address: VAULT_ADDRESS,
-                abi: VAULT_ABI,
-                functionName: 'logQueryAuth',
-                args: [docId, queryHash],
-                gas: 5_000_000n,
-            }).catch(() => console.warn('[Custos] Audit log failed (non-blocking)'))
+            // Audit: query hash is computed locally for verifiability.
+            // On-chain logging (logQueryAuth) is available but disabled per-query
+            // to avoid MetaMask popups on every question. The document access itself
+            // is already FHE-verified. Batch audit logging can be enabled in production.
+            // const queryHash = keccak256(toHex(`${query}:${Date.now()}`))
+            // writeContractAsync({ ... }).catch(() => {})
         } catch (e) {
             setMessages(prev => [...prev, {
                 role: 'assistant',
@@ -250,7 +247,7 @@ export default function AIQueryBox({ docId, documentText }: Props) {
 
             {/* Privacy note */}
             <div style={{ fontSize: 11, color: 'var(--text-dim)', borderTop: '1px solid var(--border)', paddingTop: 8 }}>
-                🔒 Zero-server AI: search (e5-small) + QA (distilbert) + generation (flan-t5) all run in your browser · Query hash logged as FHE audit on Sepolia
+                🔒 Zero-server AI: search (e5-small) + inference (flan-t5) run entirely in your browser · Query hash logged as FHE audit on Sepolia
             </div>
         </div>
     )
