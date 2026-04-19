@@ -70,27 +70,29 @@ export function isBrowserLLMLoaded(): boolean {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function generateWithBrowser(query: string, context: string): Promise<string> {
-    if (!qaModel) throw new Error('Browser LLM not loaded')
+    if (!genModel && !qaModel) throw new Error('Browser LLM not loaded')
 
-    // Try extractive QA first (more accurate for specific questions)
-    const qaResult = await qaModel(query, context)
-    console.log('[Custos] QA result:', qaResult.answer, 'score:', qaResult.score?.toFixed(3))
-
-    // If confidence is high enough, use the extractive answer
-    if (qaResult.score > 0.1 && qaResult.answer?.trim()) {
-        return qaResult.answer.trim()
-    }
-
-    // Low confidence → fall back to generative model
+    // Primary: generative model (flan-t5-small) — better at reasoning about context
+    // It can distinguish "deadline" from "opens" date, understand categories, etc.
     if (genModel) {
         const shortCtx = context.slice(0, 350)
-        const prompt = `Based on the text: ${shortCtx} ${query}`
+        const prompt = `Answer the question based only on the context below.\nContext: ${shortCtx}\nQuestion: ${query}\nAnswer:`
         const genResult = await genModel(prompt, { max_new_tokens: 150, do_sample: false })
         const answer = genResult[0]?.generated_text?.trim()
-        if (answer) return answer
+        console.log('[Custos] Generative answer:', answer)
+        if (answer && answer.length > 2) return answer
     }
 
-    return qaResult.answer?.trim() || 'I could not find a clear answer in the document. Try rephrasing your question.'
+    // Fallback: extractive QA (distilbert) — good for simple span extraction
+    if (qaModel) {
+        const qaResult = await qaModel(query, context)
+        console.log('[Custos] QA fallback:', qaResult.answer, 'score:', qaResult.score?.toFixed(3))
+        if (qaResult.score > 0.3 && qaResult.answer?.trim()) {
+            return qaResult.answer.trim()
+        }
+    }
+
+    return 'I could not find a clear answer in the document. Try rephrasing as a specific question.'
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -140,8 +142,19 @@ async function generateWithOllama(model: string, query: string, context: string)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function isGreeting(query: string): boolean {
+    const trimmed = query.trim().toLowerCase()
+    const words = trimmed.split(/\s+/)
+    if (words.length > 5) return false
     const greetings = /^(hi|hello|hey|sup|yo|greetings|good morning|good evening|thanks|thank you|ok|okay)\b/i
-    return greetings.test(query.trim()) && query.trim().split(/\s+/).length <= 4
+    return greetings.test(trimmed)
+}
+
+function isMetaQuestion(query: string): string | null {
+    const trimmed = query.trim().toLowerCase()
+    if (/^(what can you do|help|how does this work|what is this)\??$/i.test(trimmed)) {
+        return 'I can answer questions about this document. The document was decrypted locally in your browser — I search it using semantic embeddings (e5-small) and extract answers using a QA model (distilbert), all running in your browser via WebAssembly. No data ever leaves your machine. Try asking a specific question like "What is the deadline?" or "Who is eligible?"'
+    }
+    return null
 }
 
 /**
@@ -158,6 +171,11 @@ export async function runInference(
             answer: 'Hello! Ask me a question about this document and I\'ll find the answer.',
             backend: 'browser'
         }
+    }
+
+    const metaAnswer = isMetaQuestion(query)
+    if (metaAnswer) {
+        return { answer: metaAnswer, backend: 'browser' }
     }
 
     // Try Ollama first (better quality, handles long context)
