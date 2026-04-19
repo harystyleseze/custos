@@ -161,7 +161,7 @@ export default function AIQueryBox({ docId, documentText }: Props) {
                 {isLoading ? (
                     <>
                         {loadingStage === 'embeddings' && `Loading search model... ${loadProgress > 0 ? `${loadProgress}%` : '(~117MB, cached after first load)'}`}
-                        {loadingStage === 'llm' && `Loading inference model... ${loadProgress > 0 ? `${loadProgress}%` : '(~170MB, cached after first load)'}`}
+                        {loadingStage === 'llm' && `Loading inference model... ${loadProgress > 0 ? `${loadProgress}%` : '(~80MB, cached after first load)'}`}
                     </>
                 ) : isReady ? (
                     <>
@@ -247,7 +247,7 @@ export default function AIQueryBox({ docId, documentText }: Props) {
 
             {/* Privacy note */}
             <div style={{ fontSize: 11, color: 'var(--text-dim)', borderTop: '1px solid var(--border)', paddingTop: 8 }}>
-                🔒 Zero-server AI: search (e5-small WASM) + inference (LaMini-Flan-T5) run in your browser · Query hash logged as FHE audit on Sepolia
+                🔒 Zero-server AI: search (e5-small WASM) + inference (flan-t5-small WASM) run in your browser · Query hash logged as FHE audit on Sepolia
             </div>
         </div>
     )
