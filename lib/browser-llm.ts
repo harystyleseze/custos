@@ -69,7 +69,7 @@ export function isBrowserLLMLoaded(): boolean {
 // Browser inference
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Detect hallucinated or garbage responses from flan-t5 */
+/** Detect repetition loops, hallucinations, and garbage responses */
 function isLowQualityAnswer(answer: string, query: string): boolean {
     if (!answer || answer.length < 3) return true
     // Brackets indicate template/placeholder output
@@ -78,32 +78,63 @@ function isLowQualityAnswer(answer: string, query: string): boolean {
     if (answer.toLowerCase().includes(query.toLowerCase())) return true
     // Very generic non-answers
     if (/^(the|a|an|this|it|yes|no)\s*\.?$/i.test(answer)) return true
+    // Model echoing instructions back
+    if (/do not copy|read the context|based only on/i.test(answer)) return true
+    // "a.k.a." degenerate output
+    if (/^a\.k\.a\./i.test(answer)) return true
+    // Repetition loop detection: if any 4+ word phrase repeats 3+ times
+    const words = answer.toLowerCase().split(/\s+/)
+    if (words.length > 12) {
+        for (let len = 4; len <= 8; len++) {
+            const phrases = new Map<string, number>()
+            for (let i = 0; i <= words.length - len; i++) {
+                const phrase = words.slice(i, i + len).join(' ')
+                const count = (phrases.get(phrase) || 0) + 1
+                phrases.set(phrase, count)
+                if (count >= 3) return true
+            }
+        }
+    }
     return false
 }
 
 async function generateWithBrowser(query: string, context: string): Promise<string> {
     if (!genModel && !qaModel) throw new Error('Browser LLM not loaded')
 
-    // Primary: generative model (flan-t5-small) — better at reasoning about context
-    if (genModel) {
-        const shortCtx = context.slice(0, 350)
-        const prompt = `Read the context and give a clear, complete answer to the question. Do not copy headings or labels from the context.\n\nContext: ${shortCtx}\n\nQuestion: ${query}\n\nAnswer:`
-        const genResult = await genModel(prompt, { max_new_tokens: 150, do_sample: false })
-        const answer = genResult[0]?.generated_text?.trim()
-        console.log('[Custos] Generative answer:', answer)
-        if (answer && !isLowQualityAnswer(answer, query)) return answer
-    }
+    // Run both models and pick the best answer:
+    // - QA (distilbert): reliable for specific questions, extracts exact spans
+    // - Gen (flan-t5): better for open-ended questions, can synthesize
 
-    // Fallback: extractive QA (distilbert) — good for simple span extraction
+    let qaAnswer = ''
+    let qaScore = 0
     if (qaModel) {
         const qaResult = await qaModel(query, context)
-        console.log('[Custos] QA fallback:', qaResult.answer, 'score:', qaResult.score?.toFixed(3))
-        if (qaResult.score > 0.3 && qaResult.answer?.trim()) {
-            return qaResult.answer.trim()
-        }
+        qaAnswer = qaResult.answer?.trim() || ''
+        qaScore = qaResult.score || 0
+        console.log('[Custos] QA:', qaAnswer, 'score:', qaScore.toFixed(3))
     }
 
-    return 'I couldn\'t find a specific answer for that. Try asking a more specific question, like "What is the deadline?" or "What are the eligibility requirements?"'
+    // QA extracts directly from the document — always factually grounded.
+    // Prefer QA whenever it finds something, even at lower confidence,
+    // because generative models can hallucinate plausible but wrong facts.
+    if (qaScore > 0.1 && qaAnswer) return qaAnswer
+
+    // Only use generative when QA found nothing — for open-ended questions
+    if (genModel) {
+        const shortCtx = context.slice(0, 350)
+        const prompt = `Read the context and answer the question.\n\nContext: ${shortCtx}\n\nQuestion: ${query}\n\nAnswer:`
+        const genResult = await genModel(prompt, {
+            max_new_tokens: 120,
+            do_sample: false,
+            no_repeat_ngram_size: 3,
+            repetition_penalty: 1.2,
+        })
+        const genAnswer = genResult[0]?.generated_text?.trim() || ''
+        console.log('[Custos] Gen fallback:', genAnswer)
+        if (genAnswer && !isLowQualityAnswer(genAnswer, query)) return genAnswer
+    }
+
+    return 'I couldn\'t find a specific answer for that in the document. Try a more specific question like "What is the deadline?" or "What are the requirements?"'
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
