@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react'
 import { useAccount, usePublicClient } from 'wagmi'
+import { ConnectButton } from '@rainbow-me/rainbowkit'
 import { useRouter } from 'next/navigation'
 import { parseAbiItem } from 'viem'
 import DocumentUpload from '@/components/DocumentUpload'
@@ -15,6 +16,25 @@ interface DocEntry {
     txHash: string
 }
 
+const DOCS_CACHE_KEY = 'custos:docs'
+
+function loadCachedDocs(): DocEntry[] {
+    try {
+        const raw = localStorage.getItem(DOCS_CACHE_KEY)
+        if (!raw) return []
+        return JSON.parse(raw).map((d: any) => ({ ...d, blockNumber: BigInt(d.blockNumber || 0) }))
+    } catch { return [] }
+}
+
+function saveCachedDocs(docs: DocEntry[]) {
+    try {
+        localStorage.setItem(DOCS_CACHE_KEY, JSON.stringify(docs.map(d => ({
+            ...d,
+            blockNumber: String(d.blockNumber),
+        }))))
+    } catch { /* quota exceeded — ignore */ }
+}
+
 export default function DashboardContent() {
     const { address, isConnected } = useAccount()
     const router = useRouter()
@@ -22,31 +42,55 @@ export default function DashboardContent() {
     const [docs, setDocs] = useState<DocEntry[]>([])
     const [loading, setLoading] = useState(true)
 
-    // Fetch documents from on-chain events (persistent across page refresh)
+    // Fetch documents: single on-chain query + localStorage cache
     useEffect(() => {
         if (!publicClient || !isConnected) return
 
         async function fetchDocuments() {
             setLoading(true)
             try {
-                // Query DocumentRegistered events from the contract
-                const logs = await publicClient!.getLogs({
-                    address: VAULT_ADDRESS,
-                    event: parseAbiItem('event DocumentRegistered(bytes32 indexed docId, bytes32 ipfsCid)'),
-                    fromBlock: 'earliest',
-                    toBlock: 'latest',
-                })
+                const currentBlock = await publicClient!.getBlockNumber()
+                const event = parseAbiItem('event DocumentRegistered(bytes32 indexed docId, bytes32 ipfsCid)')
+                // publicnode allows larger ranges than thirdweb — use 50,000 blocks (~7 hours)
+                const fromBlock = currentBlock > 50000n ? currentBlock - 50000n : 0n
 
-                const entries: DocEntry[] = logs.map(log => ({
-                    docId: log.args.docId as string,
-                    ipfsCid: log.args.ipfsCid as string,
-                    blockNumber: log.blockNumber,
-                    txHash: log.transactionHash,
-                })).reverse() // newest first
+                let chainEntries: DocEntry[] = []
+                try {
+                    const logs = await publicClient!.getLogs({
+                        address: VAULT_ADDRESS,
+                        event,
+                        fromBlock,
+                        toBlock: 'latest',
+                    })
+                    chainEntries = logs.map(log => ({
+                        docId: log.args.docId as string,
+                        ipfsCid: log.args.ipfsCid as string,
+                        blockNumber: log.blockNumber,
+                        txHash: log.transactionHash,
+                    }))
+                } catch (e) {
+                    console.warn('[Custos] getLogs failed, using cache only:', e)
+                }
 
-                setDocs(entries)
+                // Merge with localStorage cache (covers docs older than scan window)
+                const cached = loadCachedDocs()
+                const seen = new Set(chainEntries.map(d => d.docId))
+                for (const c of cached) {
+                    if (!seen.has(c.docId)) {
+                        chainEntries.push(c)
+                    }
+                }
+
+                // Save all known docs to localStorage for future sessions
+                saveCachedDocs(chainEntries)
+
+                // Newest first
+                chainEntries.sort((a, b) => Number(b.blockNumber - a.blockNumber))
+                setDocs(chainEntries)
             } catch (e) {
                 console.error('Failed to fetch documents from chain:', e)
+                // Fallback: show cached docs
+                setDocs(loadCachedDocs())
             }
             setLoading(false)
         }
@@ -60,13 +104,12 @@ export default function DashboardContent() {
     }
 
     function onDocUploaded(docId: string) {
-        // Optimistically add to list (will also appear on next event query)
-        setDocs(prev => [{
-            docId,
-            ipfsCid: '',
-            blockNumber: 0n,
-            txHash: '',
-        }, ...prev])
+        const newDoc: DocEntry = { docId, ipfsCid: '', blockNumber: 0n, txHash: '' }
+        setDocs(prev => {
+            const updated = [newDoc, ...prev]
+            saveCachedDocs(updated)
+            return updated
+        })
     }
 
     return (
@@ -77,12 +120,7 @@ export default function DashboardContent() {
                     <img src="/logo.png" alt="Custos" style={{ width: 32, height: 32, borderRadius: 8 }} />
                     <span style={{ fontWeight: 700, fontSize: 18 }}>Custos</span>
                 </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                    <span className="badge badge-green">● Sepolia</span>
-                    <span style={{ color: 'var(--text-dim)', fontSize: 13 }} className="mono">
-                        {address?.slice(0, 6)}...{address?.slice(-4)}
-                    </span>
-                </div>
+                <ConnectButton showBalance={false} chainStatus="icon" accountStatus="address" />
             </div>
 
             {/* System Status Bar */}

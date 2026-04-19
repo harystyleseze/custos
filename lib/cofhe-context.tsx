@@ -1,63 +1,32 @@
 'use client'
 
-import { createContext, useContext, useEffect, useState, ReactNode } from 'react'
-import { usePublicClient, useWalletClient } from 'wagmi'
-import { createCofheConfig, createCofheClient } from '@cofhe/sdk/web'
-import { chains } from '@cofhe/sdk/chains'
 import { Encryptable, FheTypes } from '@cofhe/sdk'
 
 // Re-export SDK types for convenience
 export { Encryptable, FheTypes }
 
-const cofheConfig = createCofheConfig({
-    supportedChains: [chains.sepolia],
-    defaultPermitExpiration: 60 * 60 * 24 * 30, // 30 days
-})
-
-type CofheClientType = ReturnType<typeof createCofheClient>
-
-const CofheContext = createContext<CofheClientType | null>(null)
-
 /**
- * Provides the CoFHE SDK client to all child components.
- * Initializes once when wallet connects, reconnects on wallet change.
- * Replaces @cofhe/react CofheProvider (which is deprecated / v0.3.x only).
+ * Create a CoFHE SDK client on-demand.
+ * Called each time FHE encryption/decryption is needed.
+ *
+ * This avoids React context timing issues — the client is created fresh
+ * with the current publicClient and walletClient from wagmi.
  */
-export function CofheSDKProvider({ children }: { children: ReactNode }) {
-    const publicClient = usePublicClient()
-    const { data: walletClient } = useWalletClient()
-    const [cofheClient, setCofheClient] = useState<CofheClientType | null>(null)
+export async function createCofheSDKClient(publicClient: any, walletClient: any) {
+    if (typeof window === 'undefined') {
+        throw new Error('CoFHE SDK requires browser environment')
+    }
 
-    useEffect(() => {
-        if (!publicClient || !walletClient) {
-            setCofheClient(null)
-            return
-        }
+    const { createCofheConfig, createCofheClient } = await import('@cofhe/sdk/web')
+    const { chains } = await import('@cofhe/sdk/chains')
 
-        const client = createCofheClient(cofheConfig)
+    const config = createCofheConfig({
+        supportedChains: [chains.sepolia],
+        defaultPermitExpiration: 60 * 60 * 24 * 30,
+    })
 
-        client.connect(publicClient as any, walletClient as any)
-            .then(() => {
-                setCofheClient(client)
-            })
-            .catch(err => {
-                console.warn('CoFHE SDK connection failed:', err)
-                // Still set client — encryption works without full connection
-                setCofheClient(client)
-            })
-    }, [publicClient, walletClient])
+    const client = createCofheClient(config)
+    await client.connect(publicClient, walletClient)
 
-    return (
-        <CofheContext.Provider value={cofheClient}>
-            {children}
-        </CofheContext.Provider>
-    )
-}
-
-/**
- * Hook to access the CoFHE SDK client.
- * Returns null if wallet not connected yet.
- */
-export function useCofheSDK(): CofheClientType | null {
-    return useContext(CofheContext)
+    return client
 }

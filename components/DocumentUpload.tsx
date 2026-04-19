@@ -3,8 +3,9 @@
 import { useState, useRef, DragEvent, ChangeEvent } from 'react'
 import { useAccount, useSignMessage, useWriteContract } from 'wagmi'
 import { keccak256, toHex, toBytes } from 'viem'
-import { useCofheSDK, Encryptable } from '@/lib/cofhe-context'
-import { encryptFile, generateAesKey, exportAesKey, encryptKeyForWallet, KEY_DERIVATION_MESSAGE, cidToBytes32 } from '@/lib/crypto'
+import { createCofheSDKClient, Encryptable } from '@/lib/cofhe-context'
+import { usePublicClient, useWalletClient } from 'wagmi'
+import { encryptFile, generateAesKey, exportAesKey, encryptKeyForWallet, KEY_DERIVATION_MESSAGE } from '@/lib/crypto'
 import { uploadEncryptedToIPFS, cidToBytes32 as pinataCidToBytes32 } from '@/lib/pinata'
 import { VAULT_ABI, VAULT_ADDRESS } from '@/lib/vault'
 
@@ -18,7 +19,8 @@ export default function DocumentUpload({ onUploaded }: Props) {
     const { address } = useAccount()
     const { signMessageAsync } = useSignMessage()
     const { writeContractAsync } = useWriteContract()
-    const cofheClient = useCofheSDK()
+    const publicClient = usePublicClient()
+    const { data: walletClient } = useWalletClient()
 
     const [step, setStep] = useState<Step>('idle')
     const [error, setError] = useState<string>('')
@@ -61,9 +63,13 @@ export default function DocumentUpload({ onUploaded }: Props) {
             const now = BigInt(Math.floor(Date.now() / 1000))
             const docId = keccak256(toHex(`${file.name}:${address}:${Date.now()}`))
 
-            if (!cofheClient) throw new Error('CoFHE SDK not initialized — connect wallet first')
+            if (!publicClient || !walletClient) {
+                throw new Error('Wallet not fully connected. Please disconnect and reconnect your wallet.')
+            }
 
-            const [encTimestamp, encOwner] = await cofheClient
+            const cofhe = await createCofheSDKClient(publicClient, walletClient)
+
+            const [encTimestamp, encOwner] = await cofhe
                 .encryptInputs([
                     Encryptable.uint64(now),
                     Encryptable.address(address),
@@ -81,10 +87,17 @@ export default function DocumentUpload({ onUploaded }: Props) {
                     encTimestamp as any,
                     encOwner as any,
                     cidBytes32,
-                    toHex(encryptedOwnerKey),
+                    encryptedOwnerKey as `0x${string}`,
                 ],
                 gas: 5_000_000n, // FHE precompile not in eth_estimateGas — manual limit required
             })
+
+            // Store full CID in localStorage (bytes32 truncates CIDv1 strings)
+            try {
+                const cidMap = JSON.parse(localStorage.getItem('custos:cids') || '{}')
+                cidMap[docId] = cid
+                localStorage.setItem('custos:cids', JSON.stringify(cidMap))
+            } catch { /* ignore */ }
 
             setStep('done')
             onUploaded?.(docId)

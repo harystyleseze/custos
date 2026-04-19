@@ -2,10 +2,10 @@
 
 import { useState } from 'react'
 import { useAccount, useWriteContract, useReadContract } from 'wagmi'
-import { useCofheSDK, Encryptable } from '@/lib/cofhe-context'
+import { createCofheSDKClient, Encryptable } from '@/lib/cofhe-context'
+import { usePublicClient, useWalletClient, useSignMessage } from 'wagmi'
 import { VAULT_ABI, VAULT_ADDRESS } from '@/lib/vault'
 import { encryptKeyForWallet, decryptKeyFromWallet, KEY_DERIVATION_MESSAGE } from '@/lib/crypto'
-import { useSignMessage } from 'wagmi'
 
 interface Props {
     docId: `0x${string}`
@@ -15,7 +15,8 @@ interface Props {
 export default function AccessManager({ docId, isOwner }: Props) {
     const { address } = useAccount()
     const { writeContractAsync } = useWriteContract()
-    const cofheClient = useCofheSDK()
+    const publicClient = usePublicClient()
+    const { data: walletClient } = useWalletClient()
     const { signMessageAsync } = useSignMessage()
 
     const [grantee, setGrantee] = useState('')
@@ -38,8 +39,9 @@ export default function AccessManager({ docId, isOwner }: Props) {
             const expiryTimestamp = BigInt(Math.floor(Date.now() / 1000) + parseInt(expiryDays) * 86400)
 
             // Encrypt expiry with FHE
-            if (!cofheClient) throw new Error('CoFHE SDK not initialized')
-            const [encExpiry] = await cofheClient
+            if (!publicClient || !walletClient) throw new Error('Wallet not connected')
+            const cofhe = await createCofheSDKClient(publicClient, walletClient)
+            const [encExpiry] = await cofhe
                 .encryptInputs([Encryptable.uint64(expiryTimestamp)])
                 .execute()
 

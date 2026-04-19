@@ -1,10 +1,10 @@
 'use client'
 
-import { useState, KeyboardEvent } from 'react'
+import { useState, useEffect, KeyboardEvent } from 'react'
 import { useWriteContract } from 'wagmi'
 import { keccak256, toHex } from 'viem'
 import { VAULT_ABI, VAULT_ADDRESS } from '@/lib/vault'
-import { searchDocuments, indexDocument, type DocumentChunk, isModelLoaded } from '@/lib/embeddings'
+import { searchDocuments, indexDocument, loadEmbeddingModel, type DocumentChunk, isModelLoaded } from '@/lib/embeddings'
 
 interface Message {
     role: 'user' | 'assistant'
@@ -24,6 +24,25 @@ export default function AIQueryBox({ docId, documentText }: Props) {
     const [loading, setLoading] = useState(false)
     const [docIndex, setDocIndex] = useState<DocumentChunk[] | null>(null)
     const [indexing, setIndexing] = useState(false)
+    const [modelLoading, setModelLoading] = useState(false)
+    const [modelProgress, setModelProgress] = useState(0)
+    const [modelReady, setModelReady] = useState(isModelLoaded())
+
+    // Load embedding model on mount (downloads ~117MB once, then cached in IndexedDB)
+    useEffect(() => {
+        if (modelReady) return
+        setModelLoading(true)
+        loadEmbeddingModel((progress) => setModelProgress(progress))
+            .then(() => {
+                setModelReady(true)
+                setModelLoading(false)
+                console.log('[Custos] e5-small embedding model loaded')
+            })
+            .catch((e) => {
+                console.error('[Custos] Failed to load embedding model:', e)
+                setModelLoading(false)
+            })
+    }, [modelReady])
 
     // Index the document once for semantic search
     async function ensureIndexed(): Promise<DocumentChunk[]> {
@@ -88,7 +107,7 @@ export default function AIQueryBox({ docId, documentText }: Props) {
             const msg = e instanceof Error ? e.message : String(e)
             setMessages(prev => [...prev, {
                 role: 'assistant',
-                content: `Error: ${msg}\n\nMake sure Ollama is running: \`ollama serve\` and \`ollama pull phi4-mini\``
+                content: `Error: ${msg}\n\nMake sure Ollama is running: \`ollama serve\``
             }])
         }
 
@@ -108,13 +127,19 @@ export default function AIQueryBox({ docId, documentText }: Props) {
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <div style={{ fontWeight: 600 }}>AI Document Q&A</div>
                 <div style={{ display: 'flex', gap: 6 }}>
-                    <span className="badge badge-green">phi-4-mini (local)</span>
+                    <span className="badge badge-green">local LLM (Ollama)</span>
                     <span className="badge badge-purple">e5-small search</span>
                 </div>
             </div>
 
             <div style={{ color: 'var(--text-dim)', fontSize: 12 }}>
-                ⚡ Inference runs on your machine via Ollama. Document text never transmitted to any API.
+                {modelLoading ? (
+                    <>Loading e5-small embedding model... {modelProgress > 0 ? `${modelProgress}%` : '(first load downloads ~117MB, cached after)'}</>
+                ) : !modelReady ? (
+                    <>Failed to load embedding model. Refresh to retry.</>
+                ) : (
+                    <>⚡ Inference runs on your machine via Ollama. Document text never transmitted to any API.</>
+                )}
                 {indexing && ' Indexing document with e5-small...'}
             </div>
 
@@ -155,7 +180,7 @@ export default function AIQueryBox({ docId, documentText }: Props) {
                 {loading && (
                     <div style={{ display: 'flex', justifyContent: 'flex-start' }}>
                         <div style={{ padding: '8px 12px', borderRadius: '12px 12px 12px 4px', background: 'var(--surface-2)', color: 'var(--text-dim)', fontSize: 13 }}>
-                            ⏳ phi-4-mini thinking...
+                            ⏳ Thinking...
                         </div>
                     </div>
                 )}
@@ -167,15 +192,15 @@ export default function AIQueryBox({ docId, documentText }: Props) {
                     value={input}
                     onChange={e => setInput(e.target.value)}
                     onKeyDown={onKeyDown}
-                    placeholder="Ask a question about this document... (Enter to send)"
+                    placeholder={modelLoading ? 'Loading embedding model...' : 'Ask a question about this document... (Enter to send)'}
                     rows={2}
-                    disabled={loading}
+                    disabled={loading || modelLoading}
                     style={{ flex: 1, resize: 'none' }}
                 />
                 <button
                     className="btn-primary"
                     onClick={handleSend}
-                    disabled={!input.trim() || loading}
+                    disabled={!input.trim() || loading || !modelReady}
                     style={{ alignSelf: 'flex-end', padding: '8px 16px' }}
                 >
                     Ask

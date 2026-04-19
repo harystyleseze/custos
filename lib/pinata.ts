@@ -3,8 +3,8 @@
  * Only encrypted blobs are uploaded — Pinata never sees plaintext.
  */
 
-const PINATA_JWT = process.env.PINATA_JWT || process.env.NEXT_PUBLIC_PINATA_JWT || ''
-const PINATA_GATEWAY = process.env.PINATA_GATEWAY || 'https://gateway.pinata.cloud'
+const PINATA_JWT = process.env.NEXT_PUBLIC_PINATA_JWT || process.env.PINATA_JWT || ''
+const PINATA_GATEWAY = process.env.NEXT_PUBLIC_PINATA_GATEWAY || process.env.PINATA_GATEWAY || 'https://gateway.pinata.cloud'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Upload
@@ -53,21 +53,39 @@ export async function uploadEncryptedToIPFS(
 
 /**
  * Download an encrypted blob from IPFS.
- * Returns raw bytes — caller must decrypt with AES-256-GCM.
+ * Tries multiple gateways for reliability (Pinata public gateway was deprecated).
  *
  * @param cid IPFS CID
  * @returns Encrypted bytes [iv | ciphertext]
  */
 export async function downloadFromIPFS(cid: string): Promise<Uint8Array> {
-    const url = `${PINATA_GATEWAY}/ipfs/${cid}`
-    const response = await fetch(url)
+    const gateways = [
+        PINATA_GATEWAY,
+        'https://ipfs.io',
+        'https://cloudflare-ipfs.com',
+        'https://w3s.link',
+    ].filter(Boolean)
 
-    if (!response.ok) {
-        throw new Error(`IPFS download failed: ${response.status} for CID ${cid}`)
+    let lastError: Error | null = null
+
+    for (const gw of gateways) {
+        const url = `${gw}/ipfs/${cid}`
+        try {
+            console.log(`[Custos] Trying IPFS gateway: ${gw}`)
+            const response = await fetch(url, { signal: AbortSignal.timeout(15000) })
+            if (response.ok) {
+                const buffer = await response.arrayBuffer()
+                console.log(`[Custos] Downloaded ${buffer.byteLength} bytes from ${gw}`)
+                return new Uint8Array(buffer)
+            }
+            lastError = new Error(`${gw}: HTTP ${response.status}`)
+        } catch (e) {
+            lastError = e instanceof Error ? e : new Error(String(e))
+            console.warn(`[Custos] Gateway ${gw} failed:`, lastError.message)
+        }
     }
 
-    const buffer = await response.arrayBuffer()
-    return new Uint8Array(buffer)
+    throw new Error(`IPFS download failed from all gateways for CID ${cid}. Last error: ${lastError?.message}`)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

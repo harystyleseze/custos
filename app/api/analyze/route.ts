@@ -12,7 +12,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434'
-const MODEL = 'phi4-mini'
+const MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:1.5b'
 
 interface RequestBody {
     query: string
