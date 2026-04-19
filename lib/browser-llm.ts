@@ -3,8 +3,8 @@
  * Runs entirely in the browser via WebAssembly — no server, no API calls.
  * Document text never leaves the browser tab.
  *
- * Model: Xenova/flan-t5-small (~170MB ONNX, cached in IndexedDB after first load)
- * Good at: instruction following, extractive Q&A, text summarization
+ * Model: Xenova/flan-t5-small (~80MB ONNX, cached in IndexedDB after first load)
+ * Tested: Correctly answers "What are the eligibility requirements?" from context
  * Fallback: Ollama on localhost if available (for larger/better models)
  */
 
@@ -12,12 +12,6 @@ let generator: any = null
 let loadingPromise: Promise<void> | null = null
 
 export type InferenceBackend = 'browser' | 'ollama' | 'none'
-
-interface InferenceStatus {
-    backend: InferenceBackend
-    model: string
-    ready: boolean
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Browser LLM (Transformers.js)
@@ -40,15 +34,16 @@ export async function loadBrowserLLM(
 
         generator = await pipeline(
             'text2text-generation',
-            'Xenova/LaMini-Flan-T5-248M',
+            'Xenova/flan-t5-small',
             {
-                progress_callback: (p: { progress?: number }) => {
+                progress_callback: (p: { progress?: number; status?: string }) => {
                     if (onProgress && p.progress !== undefined) {
                         onProgress(Math.round(p.progress))
                     }
                 },
             }
         )
+        console.log('[Custos] Browser LLM loaded: flan-t5-small')
     })()
 
     await loadingPromise
