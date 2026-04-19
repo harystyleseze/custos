@@ -1,33 +1,56 @@
 /**
- * Browser-based LLM inference using Transformers.js.
- * Runs entirely in the browser via WebAssembly — no server, no API calls.
+ * Browser-based LLM inference for document Q&A.
+ * Runs entirely in the browser — no server, no API calls.
  * Document text never leaves the browser tab.
  *
- * Models:
- * - Xenova/distilbert-base-cased-distilled-squad (~260MB) — extractive Q&A, high accuracy
- * - Xenova/flan-t5-small (~80MB) — generative fallback for open-ended questions
- * Both cached in IndexedDB after first load.
+ * Primary: @mlc-ai/web-llm with Qwen2.5-1.5B-Instruct (WebGPU)
+ *   - 1.5B parameters, 4096 token context window
+ *   - ~1.1GB download, cached in browser after first load
+ *   - 20-60 tokens/second on modern GPUs
+ *   - Real language understanding — can synthesize, reason, explain
  *
- * Tested results:
- * - "What are the essay categories?" → "Fiction, Non-Fiction, and Poetry" (score: 0.515)
- * - "What is the deadline?" → "March 15" (score: 0.988)
- * - "Who is not eligible?" → "a former winner or runner-up" (score: 0.342)
+ * Fallback: Ollama on localhost (if available)
+ *
+ * Previous approach (flan-t5-small + distilbert) was fundamentally inadequate:
+ *   - 512 token limit, couldn't fit document context
+ *   - Extracted text fragments instead of understanding
+ *   - Repetition loops, hallucinated dates, echoed instructions
  */
-
-let qaModel: any = null
-let genModel: any = null
-let loadingPromise: Promise<void> | null = null
 
 export type InferenceBackend = 'browser' | 'ollama' | 'none'
 
+let engine: any = null
+let loadingPromise: Promise<void> | null = null
+let webllmAvailable = true
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Browser LLM Loading
+// WebGPU Detection
 // ─────────────────────────────────────────────────────────────────────────────
+
+async function hasWebGPU(): Promise<boolean> {
+    try {
+        if (typeof navigator === 'undefined') return false
+        if (!('gpu' in navigator)) return false
+        const gpu = (navigator as any).gpu
+        if (!gpu) return false
+        const adapter = await gpu.requestAdapter()
+        return adapter !== null
+    } catch {
+        return false
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Browser LLM (web-llm with Qwen2.5-1.5B)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MODEL_ID = 'Qwen2.5-1.5B-Instruct-q4f16_1-MLC'
 
 export async function loadBrowserLLM(
     onProgress?: (progress: number) => void
 ): Promise<void> {
-    if (qaModel) return
+    if (engine) return
+    if (!webllmAvailable) return
 
     if (loadingPromise) {
         await loadingPromise
@@ -35,110 +58,68 @@ export async function loadBrowserLLM(
     }
 
     loadingPromise = (async () => {
-        const { pipeline, env } = await import('@xenova/transformers')
-        env.useBrowserCache = true
-        env.allowLocalModels = false
+        // Check WebGPU support
+        const gpuOk = await hasWebGPU()
+        if (!gpuOk) {
+            console.warn('[Custos] WebGPU not available — browser LLM disabled')
+            webllmAvailable = false
+            return
+        }
 
-        // Load extractive QA model (primary — high accuracy for document Q&A)
-        qaModel = await pipeline(
-            'question-answering',
-            'Xenova/distilbert-base-cased-distilled-squad',
-            {
-                progress_callback: (p: { progress?: number }) => {
-                    if (onProgress && p.progress !== undefined) {
-                        onProgress(Math.round(p.progress))
+        try {
+            const webllm = await import('@mlc-ai/web-llm')
+
+            engine = await webllm.CreateMLCEngine(MODEL_ID, {
+                initProgressCallback: (report: { progress: number; text: string }) => {
+                    console.log('[Custos] Loading:', report.text)
+                    if (onProgress) {
+                        onProgress(Math.round(report.progress * 100))
                     }
                 },
-            }
-        )
-        console.log('[Custos] QA model loaded: distilbert-base-cased-distilled-squad')
+            })
 
-        // Load generative model (for open-ended questions where QA has low confidence)
-        genModel = await pipeline('text2text-generation', 'Xenova/flan-t5-small')
-        console.log('[Custos] Generative model loaded: flan-t5-small')
+            console.log('[Custos] Browser LLM loaded:', MODEL_ID)
+        } catch (e) {
+            console.error('[Custos] Failed to load browser LLM:', e)
+            webllmAvailable = false
+            engine = null
+        }
     })()
 
     await loadingPromise
 }
 
 export function isBrowserLLMLoaded(): boolean {
-    return qaModel !== null
+    return engine !== null
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Browser inference
-// ─────────────────────────────────────────────────────────────────────────────
-
-/** Detect repetition loops, hallucinations, and garbage responses */
-function isLowQualityAnswer(answer: string, query: string): boolean {
-    if (!answer || answer.length < 3) return true
-    // Brackets indicate template/placeholder output
-    if (/\[.*\]/.test(answer)) return true
-    // Answer is just the question echoed back
-    if (answer.toLowerCase().includes(query.toLowerCase())) return true
-    // Very generic non-answers
-    if (/^(the|a|an|this|it|yes|no)\s*\.?$/i.test(answer)) return true
-    // Model echoing instructions back
-    if (/do not copy|read the context|based only on/i.test(answer)) return true
-    // "a.k.a." degenerate output
-    if (/^a\.k\.a\./i.test(answer)) return true
-    // Repetition loop detection: if any 4+ word phrase repeats 3+ times
-    const words = answer.toLowerCase().split(/\s+/)
-    if (words.length > 12) {
-        for (let len = 4; len <= 8; len++) {
-            const phrases = new Map<string, number>()
-            for (let i = 0; i <= words.length - len; i++) {
-                const phrase = words.slice(i, i + len).join(' ')
-                const count = (phrases.get(phrase) || 0) + 1
-                phrases.set(phrase, count)
-                if (count >= 3) return true
-            }
-        }
-    }
-    return false
+export function isWebGPUAvailable(): boolean {
+    return webllmAvailable
 }
 
 async function generateWithBrowser(query: string, context: string): Promise<string> {
-    if (!genModel && !qaModel) throw new Error('Browser LLM not loaded')
+    if (!engine) throw new Error('Browser LLM not loaded')
 
-    // Run both models and pick the best answer:
-    // - QA (distilbert): reliable for specific questions, extracts exact spans
-    // - Gen (flan-t5): better for open-ended questions, can synthesize
+    const response = await engine.chat.completions.create({
+        messages: [
+            {
+                role: 'system',
+                content: 'You are a document analyst. Answer questions based ONLY on the provided document context. Be clear, accurate, and concise. If the answer is not in the context, say so.'
+            },
+            {
+                role: 'user',
+                content: `Document context:\n${context}\n\n---\nQuestion: ${query}`
+            }
+        ],
+        temperature: 0.1,
+        max_tokens: 300,
+    })
 
-    let qaAnswer = ''
-    let qaScore = 0
-    if (qaModel) {
-        const qaResult = await qaModel(query, context)
-        qaAnswer = qaResult.answer?.trim() || ''
-        qaScore = qaResult.score || 0
-        console.log('[Custos] QA:', qaAnswer, 'score:', qaScore.toFixed(3))
-    }
-
-    // QA extracts directly from the document — always factually grounded.
-    // Prefer QA whenever it finds something, even at lower confidence,
-    // because generative models can hallucinate plausible but wrong facts.
-    if (qaScore > 0.1 && qaAnswer) return qaAnswer
-
-    // Only use generative when QA found nothing — for open-ended questions
-    if (genModel) {
-        const shortCtx = context.slice(0, 350)
-        const prompt = `Read the context and answer the question.\n\nContext: ${shortCtx}\n\nQuestion: ${query}\n\nAnswer:`
-        const genResult = await genModel(prompt, {
-            max_new_tokens: 120,
-            do_sample: false,
-            no_repeat_ngram_size: 3,
-            repetition_penalty: 1.2,
-        })
-        const genAnswer = genResult[0]?.generated_text?.trim() || ''
-        console.log('[Custos] Gen fallback:', genAnswer)
-        if (genAnswer && !isLowQualityAnswer(genAnswer, query)) return genAnswer
-    }
-
-    return 'I couldn\'t find a specific answer for that in the document. Try a more specific question like "What is the deadline?" or "What are the requirements?"'
+    return response.choices[0]?.message?.content?.trim() || 'No answer generated.'
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Ollama detection (optional upgrade for better quality)
+// Ollama (optional local upgrade)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const OLLAMA_URL = 'http://localhost:11434'
@@ -167,8 +148,8 @@ async function generateWithOllama(model: string, query: string, context: string)
         body: JSON.stringify({
             model,
             messages: [
-                { role: 'system', content: 'You are a precise document analyst. Answer based ONLY on the provided document. Be concise.' },
-                { role: 'user', content: `Document:\n${context.slice(0, 4000)}\n\nQuestion: ${query}` },
+                { role: 'system', content: 'You are a document analyst. Answer based ONLY on the provided document. Be concise and accurate.' },
+                { role: 'user', content: `Document:\n${context}\n\nQuestion: ${query}` },
             ],
             stream: false,
             options: { temperature: 0.1, num_predict: 512 },
@@ -185,24 +166,18 @@ async function generateWithOllama(model: string, query: string, context: string)
 
 function isGreeting(query: string): boolean {
     const trimmed = query.trim().toLowerCase()
-    const words = trimmed.split(/\s+/)
-    if (words.length > 5) return false
-    const greetings = /^(hi|hello|hey|sup|yo|greetings|good morning|good evening|thanks|thank you|ok|okay)\b/i
-    return greetings.test(trimmed)
+    if (trimmed.split(/\s+/).length > 5) return false
+    return /^(hi|hello|hey|sup|yo|greetings|good morning|good evening|thanks|thank you|ok|okay)\b/i.test(trimmed)
 }
 
 function isMetaQuestion(query: string): string | null {
     const trimmed = query.trim().toLowerCase()
     if (/^(what can you do|help|how does this work|what is this)\??$/i.test(trimmed)) {
-        return 'I can answer questions about this document. The document was decrypted locally in your browser — I search it using semantic embeddings (e5-small) and extract answers using a QA model (distilbert), all running in your browser via WebAssembly. No data ever leaves your machine. Try asking a specific question like "What is the deadline?" or "Who is eligible?"'
+        return 'I can answer questions about this document. Ask me anything — "What is the deadline?", "Who is eligible?", "What are the submission requirements?", etc. Everything runs privately in your browser.'
     }
     return null
 }
 
-/**
- * Run document Q&A inference.
- * Priority: Ollama (if available, better quality) → Browser LLM (always works)
- */
 export async function runInference(
     query: string,
     context: string,
@@ -210,27 +185,32 @@ export async function runInference(
 ): Promise<{ answer: string; backend: InferenceBackend }> {
     if (isGreeting(query)) {
         return {
-            answer: 'Hello! Ask me a question about this document and I\'ll find the answer.',
+            answer: 'Hello! Ask me any question about this document and I\'ll find the answer.',
             backend: 'browser'
         }
     }
 
     const metaAnswer = isMetaQuestion(query)
-    if (metaAnswer) {
-        return { answer: metaAnswer, backend: 'browser' }
-    }
+    if (metaAnswer) return { answer: metaAnswer, backend: 'browser' }
 
-    // Try Ollama first (better quality, handles long context)
+    // Try Ollama first if available (potentially larger model)
     if (ollamaModel) {
         try {
             const answer = await generateWithOllama(ollamaModel, query, context)
             if (answer) return { answer, backend: 'ollama' }
         } catch {
-            console.warn('[Custos] Ollama failed, falling back to browser LLM')
+            console.warn('[Custos] Ollama failed, using browser LLM')
         }
     }
 
-    // Browser LLM
-    const answer = await generateWithBrowser(query, context)
-    return { answer, backend: 'browser' }
+    // Browser LLM (Qwen2.5-1.5B via WebGPU)
+    if (engine) {
+        const answer = await generateWithBrowser(query, context)
+        return { answer, backend: 'browser' }
+    }
+
+    return {
+        answer: 'AI models are still loading. Please wait a moment and try again.',
+        backend: 'none'
+    }
 }

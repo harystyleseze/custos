@@ -5,7 +5,7 @@ import { useWriteContract } from 'wagmi'
 import { keccak256, toHex } from 'viem'
 import { VAULT_ABI, VAULT_ADDRESS } from '@/lib/vault'
 import { searchDocuments, indexDocument, assembleContext, loadEmbeddingModel, type DocumentChunk, isModelLoaded } from '@/lib/embeddings'
-import { loadBrowserLLM, isBrowserLLMLoaded, detectOllama, runInference, type InferenceBackend } from '@/lib/browser-llm'
+import { loadBrowserLLM, isBrowserLLMLoaded, isWebGPUAvailable, detectOllama, runInference, type InferenceBackend } from '@/lib/browser-llm'
 
 interface Message {
     role: 'user' | 'assistant'
@@ -107,11 +107,11 @@ export default function AIQueryBox({ docId, documentText }: Props) {
             const index = await ensureIndexed()
             const results = await searchDocuments(query, index, 3)
 
-            // Step 2: Assemble context respecting token budget
-            const maxChars = ollamaModel ? 4000 : 350
+            // Step 2: Assemble context — Qwen2.5-1.5B has 4096 token context (~3000 chars usable)
+            const maxChars = ollamaModel ? 4000 : 3000
             const context = results.length > 0
                 ? assembleContext(results, index, maxChars)
-                : documentText.slice(0, 350)
+                : documentText.slice(0, 3000)
 
             // Step 3: Inference
             const { answer, backend } = await runInference(query, context, ollamaModel)
@@ -140,8 +140,9 @@ export default function AIQueryBox({ docId, documentText }: Props) {
         }
     }
 
-    const isReady = embeddingReady && llmReady
+    const isReady = embeddingReady && (llmReady || ollamaModel)
     const isLoading = loadingStage !== 'done'
+    const noGPU = !isLoading && !llmReady && !ollamaModel
 
     return (
         <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -149,8 +150,8 @@ export default function AIQueryBox({ docId, documentText }: Props) {
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                 <div style={{ fontWeight: 600 }}>AI Document Q&A</div>
                 <div style={{ display: 'flex', gap: 6 }}>
-                    <span className={`badge ${isReady ? 'badge-green' : 'badge-dim'}`}>
-                        {isReady ? (ollamaModel ? `${ollamaModel} (local)` : 'browser AI') : 'loading...'}
+                    <span className={`badge ${isReady ? 'badge-green' : noGPU ? 'badge-red' : 'badge-dim'}`}>
+                        {isReady ? (ollamaModel ? `${ollamaModel} (local)` : 'Qwen2.5-1.5B (browser)') : noGPU ? 'No WebGPU' : 'loading...'}
                     </span>
                     <span className="badge badge-purple">e5-small search</span>
                 </div>
@@ -161,12 +162,14 @@ export default function AIQueryBox({ docId, documentText }: Props) {
                 {isLoading ? (
                     <>
                         {loadingStage === 'embeddings' && `Loading search model... ${loadProgress > 0 ? `${loadProgress}%` : '(~117MB, cached after first load)'}`}
-                        {loadingStage === 'llm' && `Loading AI models... ${loadProgress > 0 ? `${loadProgress}%` : '(~340MB total, cached after first load)'}`}
+                        {loadingStage === 'llm' && `Loading Qwen2.5-1.5B... ${loadProgress > 0 ? `${loadProgress}%` : '(~1.1GB, cached after first load)'}`}
                     </>
+                ) : noGPU ? (
+                    <>Your browser does not support WebGPU. Use Chrome 113+ or Edge 113+ for in-browser AI. Alternatively, install <a href="https://ollama.com" target="_blank" rel="noopener" style={{ color: 'var(--accent)' }}>Ollama</a> locally.</>
                 ) : isReady ? (
                     <>
-                        All AI runs in your browser — document text never leaves this tab.
-                        {ollamaModel && <span style={{ color: 'var(--accent)' }}> Ollama detected for enhanced quality.</span>}
+                        {llmReady ? 'Qwen2.5-1.5B running in your browser via WebGPU — document text never leaves this tab.' : 'Connected to local Ollama.'}
+                        {ollamaModel && llmReady && <span style={{ color: 'var(--accent)' }}> Ollama also detected ({ollamaModel}).</span>}
                     </>
                 ) : (
                     <>Failed to load AI models. Refresh to retry.</>
@@ -247,7 +250,7 @@ export default function AIQueryBox({ docId, documentText }: Props) {
 
             {/* Privacy note */}
             <div style={{ fontSize: 11, color: 'var(--text-dim)', borderTop: '1px solid var(--border)', paddingTop: 8 }}>
-                🔒 Zero-server AI: search (e5-small) + inference (flan-t5) run entirely in your browser · Query hash logged as FHE audit on Sepolia
+                🔒 Zero-server AI: Qwen2.5-1.5B (WebGPU) + e5-small embeddings — all inference runs in your browser, nothing transmitted
             </div>
         </div>
     )
