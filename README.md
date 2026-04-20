@@ -42,7 +42,7 @@ pnpm dev
 # Open http://localhost:3000, connect MetaMask to Sepolia
 ```
 
-**For AI features:** Install [Ollama](https://ollama.ai), then `ollama serve` and `ollama pull phi4-mini`.
+**AI features** work automatically in the browser via WebGPU (Chrome 113+, Edge 113+, Safari 18+). The Qwen2.5-1.5B model (~1.1GB) downloads on first use and is cached. No local software installation needed.
 
 ---
 
@@ -71,7 +71,7 @@ Custos eliminates all three failure modes with a 4-layer privacy architecture:
 | **1. File Content** | Document text | AES-256-GCM encryption in browser before any upload |
 | **2. Storage** | Encrypted blobs | Pinata IPFS — receives only ciphertext, cannot read content |
 | **3. Access Control** | Who has access, when it expires, whether access is valid | Fhenix CoFHE on Ethereum Sepolia — `eaddress`, `euint64`, `ebool` all encrypted |
-| **4. AI Analysis** | Queries and document content during analysis | phi-4-mini runs locally via Ollama; e5-small runs in browser via WASM |
+| **4. AI Analysis** | Queries and document content during analysis | Qwen2.5-1.5B runs in browser via WebGPU (@mlc-ai/web-llm); e5-small embeddings run in browser via WASM |
 
 ---
 
@@ -123,6 +123,12 @@ The `FHE.gt(expiry, now)` comparison runs entirely in the encrypted domain. The 
 ║  │ + RainbowKit    │  │  decryptForView() │  │  (117MB WASM, 384-dim) │    ║
 ║  └────────┬────────┘  └────────┬──────────┘  └────────────┬───────────┘    ║
 ║           │                    │                           │                ║
+║  ┌────────────────────────┐                                                 ║
+║  │  @mlc-ai/web-llm       │                                                 ║
+║  │  Qwen2.5-1.5B-Instruct │                                                 ║
+║  │  (WebGPU, 4096 context) │                                                 ║
+║  └────────────────────────┘                                                 ║
+║           │                    │                           │                ║
 ║  ┌────────▼────────────────────▼───────────────────────────▼────────────┐   ║
 ║  │                   CLIENT-SIDE ENCRYPTION LAYER                       │   ║
 ║  │                                                                      │   ║
@@ -149,16 +155,16 @@ The `FHE.gt(expiry, now)` comparison runs entirely in the encrypted domain. The 
     │                      │          │  │  │                        │ │
     └──────────────────────┘          │  │  ├─ euint64  accessExpiry│ │
                                       │  │  ├─ ebool    accessResult│ │
-    ┌──────────────────────┐          │  │  └─ ebool    queryAudit  │ │
-    │                      │          │  │                           │ │
-    │  LOCAL AI            │          │  │  Sees: ciphertext hashes │ │
-    │  (phi-4-mini/Ollama) │          │  │  Knows: nothing          │ │
-    │                      │          │  └───────────────────────────┘ │
-    │  localhost:11434     │          │                                 │
-    │  Sees: plaintext     │          │  CoFHE Coprocessor handles    │
-    │  (local only)        │          │  all FHE computation off-chain │
-    │                      │          │                                 │
-    └──────────────────────┘          └─────────────────────────────────┘
+                                      │  │  └─ ebool    queryAudit  │ │
+                                      │  │                           │ │
+                                      │  │  Sees: ciphertext hashes │ │
+                                      │  │  Knows: nothing          │ │
+                                      │  └───────────────────────────┘ │
+                                      │                                 │
+                                      │  CoFHE Coprocessor handles    │
+                                      │  all FHE computation off-chain │
+                                      │                                 │
+                                      └─────────────────────────────────┘
 ```
 
 ### Data Flow: Upload Document
@@ -269,52 +275,63 @@ The `FHE.gt(expiry, now)` comparison runs entirely in the encrypted domain. The 
 ### Data Flow: AI Query with Audit
 
 ```
-    USER                    BROWSER                      OLLAMA        ETHEREUM
-     │                        │                            │               │
-     │  "What is the          │                            │               │
-     │   payment amount?"     │                            │               │
-     │ ──────────────────►    │                            │               │
-     │                        │                            │               │
-     │                 ┌──────┴──────┐                     │               │
-     │                 │ 1. SEMANTIC  │                     │               │
-     │                 │    SEARCH    │                     │               │
-     │                 │             │                     │               │
-     │                 │ e5-small    │                     │               │
-     │                 │ (WASM)      │                     │               │
-     │                 │ embed query │                     │               │
-     │                 │ cosine sim  │                     │               │
-     │                 │ top-5 chunks│                     │               │
-     │                 └──────┬──────┘                     │               │
-     │                        │                            │               │
-     │                        │  POST {context, query}     │               │
-     │                        │ ────────────────────────►  │               │
-     │                        │                            │               │
-     │                        │               ┌────────────┤               │
-     │                        │               │ phi-4-mini │               │
-     │                        │               │ T=0.1      │               │
-     │                        │               │ max=512 tk │               │
-     │                        │               └────────────┤               │
-     │                        │                            │               │
-     │                        │  ◄──── {answer} ───────────│               │
-     │                        │                            │               │
-     │                 ┌──────┴──────┐                     │               │
-     │                 │ 2. ON-CHAIN │                     │               │
-     │                 │    AUDIT    │                     │               │
-     │                 │             │                     │               │
-     │                 │ hash =      │                     │               │
-     │                 │ keccak256(  │                     │               │
-     │                 │ query+ts)   │  logQueryAuth       │               │
-     │                 │             │  (docId, hash)      │  ┌──────────┐│
-     │                 │             │ ───────────────────────►│ STORES:  ││
-     │                 │             │                     │  │ ebool    ││
-     │                 │             │                     │  │ (was     ││
-     │                 │             │                     │  │ author-  ││
-     │                 │             │                     │  │ ized?)   ││
-     │                 └──────┬──────┘                     │  └──────────┘│
-     │                        │                            │               │
-     │  "The payment amount   │                            │               │
-     │   is $50,000..."       │                            │               │
-     │ ◄──────────────────    │                            │               │
+    USER                    BROWSER                                 ETHEREUM
+     │                        │                                        │
+     │  "What is the          │                                        │
+     │   deadline?"           │                                        │
+     │ ──────────────────►    │                                        │
+     │                        │                                        │
+     │                 ┌──────┴──────┐                                 │
+     │                 │ 1. SEMANTIC  │                                 │
+     │                 │    SEARCH    │                                 │
+     │                 │              │                                 │
+     │                 │ e5-small     │                                 │
+     │                 │ (WASM)       │                                 │
+     │                 │ embed query  │                                 │
+     │                 │ cosine sim   │                                 │
+     │                 │ top-3 chunks │                                 │
+     │                 │ + adjacent   │                                 │
+     │                 └──────┬──────┘                                 │
+     │                        │                                        │
+     │                 ┌──────┴──────┐                                 │
+     │                 │ 2. CONTEXT   │                                 │
+     │                 │    ASSEMBLY  │                                 │
+     │                 │              │                                 │
+     │                 │ heading      │                                 │
+     │                 │ prefix +     │                                 │
+     │                 │ doc order +  │                                 │
+     │                 │ 3000 chars   │                                 │
+     │                 └──────┬──────┘                                 │
+     │                        │                                        │
+     │                 ┌──────┴──────┐                                 │
+     │                 │ 3. BROWSER   │                                 │
+     │                 │    LLM       │                                 │
+     │                 │              │                                 │
+     │                 │ Qwen2.5-1.5B │                                 │
+     │                 │ via WebGPU   │                                 │
+     │                 │ T=0.1        │                                 │
+     │                 │ max=300 tk   │                                 │
+     │                 │ 4096 context │                                 │
+     │                 └──────┬──────┘                                 │
+     │                        │                                        │
+     │  "The deadline is      │                                        │
+     │   April 20, 2026..."   │                                        │
+     │ ◄──────────────────    │                                        │
+     │                        │                                        │
+     │                 ┌──────┴──────┐                                 │
+     │                 │ 4. ON-CHAIN │                                 │
+     │                 │    AUDIT    │                                 │
+     │                 │ (after      │                                 │
+     │                 │  answer)    │                                 │
+     │                 │              │  logQueryAuth                   │
+     │                 │ hash =       │  (docId, hash)    ┌──────────┐│
+     │                 │ keccak256(   │ ─────────────────► │ STORES:  ││
+     │                 │ query+ts)    │                    │ ebool    ││
+     │                 │              │                    │ (was     ││
+     │                 │ non-blocking │                    │ author-  ││
+     │                 │              │                    │ ized?)   ││
+     │                 └──────────────┘                    └──────────┘│
+     │                                                                 │
 ```
 
 ### Privacy Guarantee Matrix
@@ -323,11 +340,11 @@ The `FHE.gt(expiry, now)` comparison runs entirely in the encrypted domain. The 
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                        WHAT EACH PARTY SEES                             │
 ├──────────────────┬──────────┬───────────┬───────────┬──────────────────┤
-│                  │  Pinata  │ Ethereum  │  Ollama   │   Other Users    │
-│                  │  (IPFS)  │  Nodes    │  (Local)  │   / Observers    │
+│                  │  Pinata  │ Ethereum  │ Browser   │   Other Users    │
+│                  │  (IPFS)  │  Nodes    │ LLM(GPU)  │   / Observers    │
 ├──────────────────┼──────────┼───────────┼───────────┼──────────────────┤
 │ File content     │ ██ AES   │     -     │ Plaintext │       -          │
-│                  │ cipher   │           │ (local)   │                  │
+│                  │ cipher   │           │ (tab only)│                  │
 ├──────────────────┼──────────┼───────────┼───────────┼──────────────────┤
 │ Document owner   │    -     │ ██ FHE    │     -     │  ██ FHE cipher   │
 │                  │          │ eaddress  │           │                  │
@@ -339,7 +356,7 @@ The `FHE.gt(expiry, now)` comparison runs entirely in the encrypted domain. The 
 │                  │          │ ebool     │           │                  │
 ├──────────────────┼──────────┼───────────┼───────────┼──────────────────┤
 │ AI query         │    -     │  hash     │ Plaintext │   hash only      │
-│                  │          │  only     │ (local)   │                  │
+│                  │          │  only     │ (tab only)│                  │
 ├──────────────────┼──────────┼───────────┼───────────┼──────────────────┤
 │ Search vectors   │    -     │     -     │     -     │       -          │
 │                  │          │           │           │  (browser only)  │
@@ -349,7 +366,7 @@ The `FHE.gt(expiry, now)` comparison runs entirely in the encrypted domain. The 
 └──────────────────┴──────────┴───────────┴───────────┴──────────────────┘
 
   ██ = Encrypted (party cannot read)     - = Not present at this party
-  Plaintext (local) = Only on user's machine, never transmitted
+  Plaintext (tab only) = Only in user's browser tab, never transmitted
 ```
 
 ### Smart Contract State Diagram
@@ -480,8 +497,8 @@ The `FHE.gt(expiry, now)` comparison runs entirely in the encrypted domain. The 
 │ File           │ Server-  │    ✗     │ Client-  │ Server-  │ ✅ Client  │
 │ Encryption     │ side     │          │ side     │ side     │ AES-256    │
 ├────────────────┼──────────┼──────────┼──────────┼──────────┼────────────┤
-│ AI             │ ChatGPT  │ Cloud    │    ✗     │ Cloud    │ ✅ Local   │
-│ Integration    │ (exposed)│ (exposed)│          │ (exposed)│ phi-4-mini │
+│ AI             │ ChatGPT  │ Cloud    │    ✗     │ Cloud    │ ✅ Browser │
+│ Integration    │ (exposed)│ (exposed)│          │ (exposed)│ Qwen2.5    │
 ├────────────────┼──────────┼──────────┼──────────┼──────────┼────────────┤
 │ Access         │    ✗     │    ✗     │    ✗     │    ✗     │ ✅ FHE     │
 │ Metadata       │ Public   │ Public   │ Public   │ Central  │ Encrypted  │
@@ -571,21 +588,25 @@ The AES key never leaves the browser in plaintext. Only the wallet holder can re
 
 ## AI Layer
 
-### phi-4-mini (Document Q&A)
+### Qwen2.5-1.5B-Instruct (Document Q&A)
 
-- **Model:** Microsoft phi-4-mini (3.8B parameters)
-- **Runtime:** Ollama (local, `http://localhost:11434`)
+- **Model:** Qwen2.5-1.5B-Instruct (1.5B parameters, 4096 token context)
+- **Runtime:** `@mlc-ai/web-llm` v0.2.82 (WebGPU, runs in browser)
+- **Download:** ~1.1GB, cached in browser storage after first load
+- **Performance:** 20-60 tokens/second on modern GPUs
 - **Temperature:** 0.1 (factual, grounded responses)
-- **Max tokens:** 512
-- **System prompt:** "Answer only from the provided document context"
-- **Privacy:** Document text stays on localhost — no external API calls
+- **Max tokens:** 300
+- **API:** OpenAI-compatible chat completions
+- **Privacy:** Document text never leaves the browser tab — no server, no API calls
+- **Fallback:** Ollama on localhost auto-detected for enhanced quality (optional)
 
 ### multilingual-e5-small (Semantic Search)
 
 - **Model:** `intfloat/multilingual-e5-small` (117MB, 384-dim)
 - **Runtime:** `@xenova/transformers` (WebAssembly, runs in browser)
-- **Chunking:** 400-char chunks, 50-char overlap
-- **Search:** Cosine similarity, 0.5 threshold, top-5 results
+- **Chunking:** Structure-aware: paragraph → sentence → character cascade, ~300-char target, heading metadata
+- **Search:** Cosine similarity, 0.6 threshold, top-3 results with heading/position metadata
+- **Context assembly:** `assembleContext()` — top chunk + adjacent, document order, heading prefix, 3000-char budget
 - **Caching:** IndexedDB (loads once, cached for subsequent sessions)
 - **Privacy:** Embeddings computed in browser — never transmitted
 
@@ -675,10 +696,11 @@ Owner enters grantee address + expiry (days)
 User types question
   → e5-small embeds query in browser (WASM)
   → Cosine similarity against document chunks (browser-local)
-  → Top-5 chunks + query sent to phi-4-mini (localhost Ollama)
-  → queryHash = keccak256(query + timestamp) stored on-chain
-  → FHE-encrypted authorization proof recorded
-  → Answer displayed — no external AI API call made
+  → assembleContext(): top-3 chunks + adjacent, heading prefix, 3000-char budget
+  → Qwen2.5-1.5B processes context + question via WebGPU (in browser)
+  → Answer displayed to user
+  → queryHash = keccak256(query + timestamp) available for on-chain audit
+  → No external AI API call made — all inference in browser tab
 ```
 
 ### Revoke Access
@@ -705,7 +727,7 @@ Owner clicks revoke for a grantee
 | Wallet | wagmi v2 + viem + RainbowKit | 2.12.0 / 2.17.0 / 2.2.0 |
 | File Encryption | Web Crypto API (AES-256-GCM) | Browser native |
 | IPFS | Pinata | 1.1.0 |
-| AI Inference | phi-4-mini via Ollama | Local |
+| AI Inference | Qwen2.5-1.5B via `@mlc-ai/web-llm` (WebGPU) | 0.2.82 |
 | Embeddings | multilingual-e5-small via `@xenova/transformers` | WASM |
 | Package Manager | pnpm | 10+ |
 | Runtime | Node.js | v20+ |
@@ -728,18 +750,19 @@ custos/
 │   │   ├── page.tsx → DashboardContent.tsx  # Document list + upload
 │   │   └── [docId]/
 │   │       ├── page.tsx → DocViewerContent.tsx  # Document viewer + AI
-│   └── api/analyze/route.ts          # phi-4-mini inference endpoint
+│   └── api/analyze/route.ts          # Ollama fallback endpoint (optional)
 ├── components/
 │   ├── DocumentUpload.tsx             # 4-step upload with progress
 │   ├── AccessManager.tsx              # Grant/revoke FHE-encrypted access
-│   ├── AIQueryBox.tsx                 # Semantic search + AI Q&A + audit
+│   ├── AIQueryBox.tsx                 # Semantic search + Qwen2.5 Q&A (WebGPU)
 │   └── EncryptionStatus.tsx           # Privacy layers visualization
 ├── lib/
 │   ├── crypto.ts                      # AES-256-GCM + wallet key wrapping
-│   ├── cofhe-context.tsx              # CoFHE SDK v0.4.0 React context (replaces @cofhe/react)
+│   ├── cofhe-context.tsx              # CoFHE SDK v0.4.0 (replaces @cofhe/react)
 │   ├── vault.ts                       # Contract ABI + address
-│   ├── pinata.ts                      # IPFS upload/download
-│   └── embeddings.ts                  # e5-small WASM semantic search
+│   ├── pinata.ts                      # IPFS upload/download (multi-gateway fallback)
+│   ├── embeddings.ts                  # Structure-aware chunking + e5-small search
+│   └── browser-llm.ts                 # Qwen2.5-1.5B via @mlc-ai/web-llm (WebGPU)
 ├── deployments/
 │   └── eth-sepolia.json               # Deployed contract address
 ├── hardhat.config.ts                  # Compile + deploy + test config
@@ -788,31 +811,35 @@ OLLAMA_URL=http://localhost:11434
 - [x] 14-test suite on CoFHE v0.4.x mock backend
 - [x] Full Next.js frontend (landing, dashboard, document viewer) with RainbowKit wallet connect
 - [x] AES-256-GCM browser encryption + Pinata IPFS storage
-- [x] phi-4-mini local AI + e5-small WASM semantic search (full RAG pipeline in browser)
+- [x] Local AI + e5-small WASM semantic search (full RAG pipeline)
 - [x] FHE query audit logging (encrypted authorization proof on-chain)
 - [x] Side-channel resistance (no reverts leaking document existence)
 - [x] @cofhe/sdk v0.4.0 direct (no deprecated cofhejs or @cofhe/react)
 - [x] Deployed and verified on Ethereum Sepolia
 
-### Wave 3 (April 8 - May 8) — AI Pipeline + Production Hardening
-- [ ] Persistent vector store in IndexedDB (embeddings survive page refresh)
-- [ ] Conversation memory (follow-up questions maintain context across Q&A pairs)
-- [ ] Paragraph-aware chunking (split on `\n\n` and `. ` instead of mid-word)
-- [ ] Proper ECDH key re-encryption for grantees
-- [ ] ReineiraOS integration: `IConditionResolver` for paid document access
-- [ ] UI/UX polish (loading states, error recovery, responsive design)
+### Wave 3 (April 8 - May 8) — Browser LLM + AI Pipeline
+- [x] Browser-native LLM: Qwen2.5-1.5B via @mlc-ai/web-llm (WebGPU, no Ollama needed)
+- [x] Structure-aware adaptive chunking (paragraph → sentence → character, heading metadata)
+- [x] Multi-format document rendering (text, PDF, images, binary download)
+- [x] Improved semantic search (0.6 threshold, top-3, heading-prefixed embeddings)
+- [x] Context assembly with document ordering, heading prefix, 3000-char budget
+- [ ] Conversation memory (follow-up questions maintain context)
+- [ ] UI/UX polish (loading states, responsive design, document names)
+- [ ] LLM download optimization (progress bar, Web Worker, preloading)
+- [ ] ECDH key re-encryption for grantees
 
-### Wave 4 (May 11 - May 20) — Multi-Document AI + Ecosystem Depth
-- [ ] Multi-document semantic search (query across all user's documents)
-- [ ] `FHE.select()` for advanced conditional logic (zero-information branching)
-- [ ] Encrypted on-chain analytics via `FHE.add()` accumulation
-- [ ] Multi-party threshold decryption exploration
-- [ ] Cross-chain deployment (Arbitrum Sepolia, Base Sepolia)
+### Wave 4 (May 11 - May 20) — Multi-Format AI + Ecosystem
+- [ ] PDF text extraction for AI Q&A (not just rendering)
+- [ ] DOCX/DOC parsing for AI Q&A
+- [ ] Multi-document semantic search (query across all documents)
+- [ ] IndexedDB vector persistence (embeddings survive page refresh)
+- [ ] `FHE.select()` for advanced conditional logic
+- [ ] Encrypted on-chain analytics via `FHE.add()`
 
-### Wave 5 (May 23 - June 1) — Demo Day + Production Readiness
-- [ ] Compliance export: cryptographic proof of access audit logs for auditors
-- [ ] Cross-encoder reranker for search accuracy (~30MB MiniLM ONNX)
-- [ ] Streaming AI responses (real-time token display from phi-4-mini)
+### Wave 5 (May 23 - June 1) — Production + Demo
+- [ ] Streaming AI responses (real-time token display via WebGPU)
+- [ ] Web Worker inference (non-blocking UI)
+- [ ] Compliance export: cryptographic proof of audit logs
 - [ ] 5-minute narrated demo video showing full pipeline
 - [ ] Mainnet readiness assessment (gas costs, security review, performance benchmarks)
 
