@@ -113,7 +113,7 @@ Custos is a document intelligence platform with four properties that don't exist
 
 2. **FHE-encrypted access control** — Document ownership (`eaddress`), access expiry (`euint64`), and access check results (`ebool`) are all stored as ciphertexts on Ethereum Sepolia via Fhenix CoFHE. The blockchain cannot answer "who owns document X?" or "does wallet Y have access?" without FHE decryption by the authorized party.
 
-3. **Local AI analysis** — phi-4-mini (3.8B parameters) runs on the user's machine via Ollama. Semantic search uses multilingual-e5-small running as WebAssembly in the browser. No document content ever reaches an external API.
+3. **Local AI analysis** — Qwen2.5-1.5B-Instruct (1.5B parameters) runs entirely in the user's browser via WebGPU using @mlc-ai/web-llm (~1.1GB, cached after first load). Semantic search uses multilingual-e5-small running as WebAssembly in the browser. No document content ever reaches any external server — all AI inference happens in the browser tab.
 
 4. **Encrypted audit trail** — Every AI query produces an on-chain keccak256 hash + an FHE-encrypted boolean proving the query was authorized at query time. Auditors can verify compliance without reading query content or document text.
 
@@ -186,9 +186,10 @@ ZK-proofs can prove "I have access" but **cannot compute** "is access still vali
 │  (encrypted). Access result: ebool (encrypted).                  │
 │  → Blockchain sees: ciphertext hashes. Knows: nothing.           │
 ├──────────────────────────────────────────────────────────────────┤
-│  LAYER 3: AI ANALYSIS — Local Inference (Browser + Ollama)        │
+│  LAYER 3: AI ANALYSIS — Browser Inference (WebGPU)                │
 │  e5-small embeddings computed in browser WASM (never transmitted).│
-│  phi-4-mini runs on localhost via Ollama (never transmitted).     │
+│  Qwen2.5-1.5B runs in the browser tab via WebGPU.               │
+│  → External servers see: nothing. Document stays in browser tab. │
 │  → External servers see: nothing. Document stays local.          │
 ├──────────────────────────────────────────────────────────────────┤
 │  LAYER 4: AUDIT TRAIL — FHE-Encrypted On-Chain Proof              │
@@ -205,7 +206,7 @@ ZK-proofs can prove "I have access" but **cannot compute** "is access still vali
 | **Pinata (IPFS)** | AES ciphertext | Nothing | Nothing | Nothing | Nothing |
 | **Ethereum validators** | Nothing | eaddress cipher | euint64 cipher | Hash only | ebool cipher |
 | **Other wallets** | Nothing | eaddress cipher | euint64 cipher | Hash only | ebool cipher |
-| **Ollama (local AI)** | Plaintext (local only) | Nothing | Nothing | Plaintext (local) | Nothing |
+| **Browser LLM (WebGPU)** | Plaintext (browser tab only) | Nothing | Nothing | Plaintext (browser tab) | Nothing |
 | **Document owner** | Plaintext (after decrypt) | Their own identity | Their own grants | Their own queries | Their own results |
 | **Grantee** | Plaintext (if granted) | Nothing about others | Their own expiry | Their own queries | Their own results |
 
@@ -213,69 +214,65 @@ ZK-proofs can prove "I have access" but **cannot compute** "is access still vali
 
 ## How the AI Pipeline Works
 
-Custos runs a complete RAG (Retrieval-Augmented Generation) pipeline where every step is either in the browser or on localhost. No document content ever reaches an external server.
+Custos runs a complete RAG (Retrieval-Augmented Generation) pipeline where every step runs in the browser. No document content ever reaches an external server.
 
-### Step 1: Document Chunking
+### Step 1: Structure-Aware Document Chunking
 
-When a user opens a decrypted document, the browser splits the text into overlapping chunks:
-- **Chunk size:** 400 characters (~100-120 tokens)
-- **Overlap:** 50 characters between adjacent chunks (maintains context at boundaries)
-- **Fragments < 20 chars are skipped** (prevents indexing whitespace/artifacts)
-- A 10-page document (~5,000 chars) produces approximately 14 chunks
+When a user opens a decrypted document, the browser splits the text into semantically coherent chunks:
+- **Strategy:** 3-tier cascade — paragraph boundaries first (`\n\n`), then sentence boundaries (`. ` followed by uppercase), then character split at word boundaries as last resort
+- **Target chunk size:** ~300 characters (~80-100 tokens)
+- **Heading detection:** Markdown (`# Heading`), ALL-CAPS lines, title-case labels (`Eligibility Requirements`), and colon-terminated labels (`Age:`)
+- **Metadata:** Each chunk carries its nearest section heading and document position index
+- A 6,000-word document produces approximately 20-30 chunks
 
 This happens in `lib/embeddings.ts` → `chunkText()`. No network call.
 
-### Step 2: Vector Embedding
+### Step 2: Vector Embedding with Heading Context
 
 Each chunk is converted into a 384-dimensional numerical vector using **multilingual-e5-small**:
-- **Model:** `intfloat/multilingual-e5-small` (117MB)
+- **Model:** `intfloat/multilingual-e5-small` (117MB, cached in IndexedDB)
 - **Runtime:** `@xenova/transformers` — runs as WebAssembly in the browser
-- **Caching:** model downloaded once, cached in IndexedDB for subsequent sessions
-- **Prefixes:** documents use `"passage: "` prefix, queries use `"query: "` prefix (required by e5 architecture)
-- **Output:** `Float32Array` of 384 dimensions per chunk
-
-This happens entirely in the browser tab. The embedding model runs in WASM — no server, no API, no network call. 100+ languages supported.
+- **Heading prefix:** Chunks are embedded with their section heading prepended for better semantic matching: `"passage: Eligibility Requirements: You must be between 18 and 35 years old"`
+- **Output:** `Float32Array` of 384 dimensions per chunk, with heading and position metadata
 
 ### Step 3: Semantic Search
 
 When the user asks a question:
-1. The question is embedded with the same model: `embedQuery("query: " + question)` → 384-dim vector
-2. **Cosine similarity** is computed between the query vector and every chunk vector
-3. Chunks scoring above **0.5 threshold** are kept
-4. **Top 5 chunks** are returned, ranked by relevance score
-
-This is a brute-force search over ~14 vectors — takes <10ms. No vector database needed at this scale.
+1. The question is embedded: `embedQuery("query: " + question)` → 384-dim vector
+2. **Cosine similarity** computed between the query vector and every chunk vector
+3. Chunks scoring above **0.6 threshold** are kept (raised from 0.5 for better precision)
+4. **Top 3 chunks** returned with heading and position metadata
 
 ### Step 4: Context Assembly
 
-The top-5 relevant chunks are joined into a context string:
-- If semantic search found results: chunks joined with `---` separators
-- If no chunks passed the 0.5 threshold: fallback to the first 2,000 characters of the document
-- Total context is **capped at 4,000 characters** to stay within the LLM's useful context window
+The `assembleContext()` function builds an optimal context window:
+- Takes the top search result plus its **adjacent chunks** (position ± 1) for boundary context
+- Sorts selected chunks by **document position** (natural reading order, not relevance score)
+- Prepends the **section heading** as a context hint: `"[Eligibility Requirements]\n"`
+- Truncates to **3,000 characters** (fitting within Qwen2.5's 4096-token context window)
+- For Ollama fallback: budget expands to 4,000 characters
 
-### Step 5: Local LLM Inference
+### Step 5: Browser LLM Inference
 
-The assembled context + user question are sent to **phi-4-mini** (3.8B parameters):
-- **Runtime:** Ollama running on `localhost:11434`
-- **System prompt:** "You are a precise document analyst. Answer questions based ONLY on the provided document excerpt. If the answer is not in the document, say so. Be concise and accurate."
+The assembled context + user question are processed by **Qwen2.5-1.5B-Instruct**:
+- **Runtime:** `@mlc-ai/web-llm` v0.2.82 — runs via WebGPU entirely in the browser
+- **Model size:** ~1.1GB download, cached in browser storage after first load
+- **Context window:** 4,096 tokens (~3,000 words of context per query)
+- **API:** OpenAI-compatible chat completions (system + user messages)
 - **Temperature:** 0.1 (factual, grounded — minimizes hallucination)
-- **Max tokens:** 512 (concise responses)
+- **Max tokens:** 300 (concise responses)
+- **Performance:** 20-60 tokens/second on modern GPUs via WebGPU
+- **Fallback:** Ollama on localhost if available (auto-detected)
 
-The request goes to `localhost` — the LLM runs on the user's machine. No document content ever reaches an external API.
+The LLM runs in the browser tab. No document content ever reaches any external server.
 
-### Step 6: On-Chain Query Audit
+### Step 6: Audit Trail (Non-Blocking)
 
-After generating the answer, Custos records an encrypted audit proof:
-1. `queryHash = keccak256(query text + timestamp)` — the query content is hidden; only its hash is on-chain
-2. `logQueryAuth(docId, queryHash)` is called on `DocumentVault.sol`
-3. The contract computes `FHE.gt(expiry, block.timestamp)` to check if the user was authorized at query time
-4. The result (`ebool wasAuthorized`) is stored encrypted on-chain
-5. `QueryLogged` event is emitted with `docId` and `queryHash`
-
-**What auditors can verify:** "A query was made against document X at time T, and the user was authorized."
-**What auditors cannot see:** What the query asked, what the document contained, or what the answer was.
-
-This is the **only document AI tool with an on-chain authorization audit trail** that preserves content privacy.
+After displaying the answer, Custos can record an encrypted audit proof:
+1. `queryHash = keccak256(query text + timestamp)` — query content hidden
+2. `logQueryAuth(docId, queryHash)` on DocumentVault.sol
+3. FHE-encrypted boolean proves query was authorized at query time
+4. Currently disabled per-query to avoid MetaMask popup interruptions; capability preserved for batch audit logging in production
 
 ---
 
@@ -328,7 +325,7 @@ Obolos (scored 47/50 in Wave 1) is architecturally similar — hybrid FHE + AES 
 | Feature | Dropbox | Notion AI | Lit Protocol | Obolos | **Custos** |
 |---|---|---|---|---|---|
 | File encryption | Server-side | No | Client-side | AES + FHE keys | **AES-256-GCM (browser)** |
-| AI document Q&A | ChatGPT (exposed) | Cloud (exposed) | No | No | **phi-4-mini (local)** |
+| AI document Q&A | ChatGPT (exposed) | Cloud (exposed) | No | No | **Qwen2.5-1.5B (browser WebGPU)** |
 | Semantic search | No | Cloud | No | No | **e5-small (browser WASM)** |
 | Access metadata private | No | No | No | Yes (FHE room keys) | **Yes (eaddress + euint64 + ebool)** |
 | Time-bounded access | No | No | On-chain conditions | No | **FHE.gt(expiry, now) → ebool** |
@@ -382,7 +379,7 @@ Data can't leak because it never exists in plaintext outside the user's browser.
 
 ### 2. AI Without Compromise
 
-phi-4-mini runs locally via Ollama. multilingual-e5-small runs in the browser as WebAssembly. No document content ever reaches an external server. The user gets AI-powered document analysis without any privacy trade-off.
+Qwen2.5-1.5B-Instruct runs entirely in the browser via WebGPU. multilingual-e5-small runs in the browser as WebAssembly. No document content ever reaches any external server. No local software installation required. The user gets AI-powered document analysis without any privacy trade-off — not even a localhost dependency.
 
 ### 3. Audit Without Exposure
 
@@ -408,12 +405,14 @@ Users see: upload, share, ask questions, revoke. They don't see: AES-256-GCM enc
 | FHE access control | ✅ Working | eaddress, euint64, ebool — 6 FHE operations |
 | Time-bounded grants | ✅ Working | FHE.gt(expiry, now) → encrypted boolean |
 | Access revocation | ✅ Working | Overwrite with encrypted zero → permanent denial |
-| Semantic search | ✅ Working | e5-small WASM, 384-dim, cosine similarity, top-5 |
-| Local AI Q&A | ✅ Working | phi-4-mini via Ollama, T=0.1, 512 max tokens |
+| Semantic search | ✅ Working | e5-small WASM, 384-dim, cosine similarity, 0.6 threshold, top-3 |
+| Browser AI Q&A | ✅ Working | Qwen2.5-1.5B via @mlc-ai/web-llm (WebGPU), T=0.1, 4096 context |
 | On-chain audit | ✅ Working | keccak256 hash + FHE ebool authorization proof |
 | Side-channel resistance | ✅ Working | No reverts leak document existence |
 | Contract | ✅ Deployed | Ethereum Sepolia, verified on Etherscan |
 | Tests | ✅ 14 passing | CoFHE v0.4.0 mock backend |
+| Document rendering | ✅ Working | Multi-format: text (inline), PDF (iframe), images, binary download |
+| Adaptive chunking | ✅ Working | Structure-aware: paragraph → sentence → character, heading metadata |
 | SDK | ✅ Current | @cofhe/sdk v0.4.0 direct (no deprecated cofhejs) |
 
 ### What's Honestly Limited
@@ -422,11 +421,13 @@ Users see: upload, share, ask questions, revoke. They don't see: AES-256-GCM enc
 |---|---|---|
 | Embeddings recompute on page refresh | Stored in React state, not IndexedDB | Wave 3 |
 | No conversation memory | Each question independent, no follow-up context | Wave 3 |
-| Fixed-size chunking | Can split mid-sentence at 400-char boundary | Wave 3 |
+| ~~Fixed-size chunking~~ | ~~Can split mid-sentence~~ — **FIXED:** Structure-aware chunking | Done |
 | Simplified key re-encryption | Signature-derived (not full ECDH) | Wave 3 |
 | Single-document search only | Can't query across multiple documents | Wave 4 |
 | No reranking | Raw cosine similarity, no cross-encoder | Wave 5 |
-| Ollama dependency for AI | Must install locally, ~2GB model download | Future |
+| WebGPU requirement | Browser must support WebGPU (Chrome 113+, Edge 113+, Safari 18+) | Inherent |
+| Text-only AI Q&A | PDF/DOCX files render but AI only queries text content currently | Wave 4 |
+| Model download size | ~1.1GB first load for Qwen2.5-1.5B (cached after) | Wave 3: optimize |
 
 These limitations are documented, not hidden. They're the roadmap.
 
@@ -436,12 +437,12 @@ These limitations are documented, not hidden. They're the roadmap.
 
 > Custos entered the buildathon at Wave 2.
 
-**Wave 2 (Current — First Submission):** Full build. Contract deployed. 14 tests. Full RAG pipeline. RainbowKit. Side-channel resistance. @cofhe/sdk v0.4.0.
+**Wave 2 (Completed — First Submission):** Full build. Contract deployed. 14 tests. Full RAG pipeline. RainbowKit. Side-channel resistance. @cofhe/sdk v0.4.0.
 
-**Wave 3 (April 8 - May 8):** AI pipeline hardening (IndexedDB vectors, conversation memory, paragraph-aware chunking). ECDH key re-encryption for real multi-user sharing. ReineiraOS IConditionResolver for paid document access.
+**Wave 3 (Current — AI + Browser LLM):** Browser-native LLM (Qwen2.5-1.5B via WebGPU, no Ollama needed). Structure-aware adaptive chunking with heading detection. Multi-format document rendering (text, PDF, images). UI/UX polish. LLM download speed optimization. Conversation memory for follow-up questions.
 
-**Wave 4 (May 11-20):** Multi-document AI search. FHE.select() for zero-information branching. Encrypted on-chain analytics via FHE.add(). Cross-chain deployment. Compliance export.
+**Wave 4 (May 11-20 — Multi-Format AI + Ecosystem):** PDF text extraction and DOCX parsing for AI Q&A (not just rendering). Multi-document search across all user's documents. IndexedDB vector persistence. FHE.select() for zero-information branching. Encrypted on-chain analytics via FHE.add().
 
-**Wave 5 (May 23 - June 1):** Cross-encoder reranker. Streaming AI responses. 5-minute demo video. Mainnet readiness assessment.
+**Wave 5 (May 23 - June 1 — Production + Demo):** Streaming AI responses. Web Worker inference (non-blocking UI). Compliance export (verifiable audit reports). 5-minute demo video. Mainnet readiness assessment.
 
-**Beyond Buildathon:** Enterprise pilot with a mid-market law firm. Containerized AI inference (no Ollama dependency). Mainnet deployment. SOC 2 Type I certification pathway.
+**Beyond Buildathon:** Enterprise pilot with a mid-market law firm. Advanced document format support (spreadsheets, presentations). Cross-chain deployment. SOC 2 Type I certification pathway.

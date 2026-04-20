@@ -14,6 +14,7 @@ graph TB
         AES["Web Crypto API<br/>AES-256-GCM"]
         E5["multilingual-e5-small<br/>WASM Embeddings (117MB)"]
         CRYPTO["Wallet Key Wrapping<br/>sign() → SHA-256 → AES-KW"]
+        WEBLLM["Qwen2.5-1.5B-Instruct<br/>@mlc-ai/web-llm (WebGPU)<br/>4096 token context"]
     end
 
     subgraph Ethereum["Ethereum Sepolia (CoFHE)"]
@@ -25,24 +26,19 @@ graph TB
         BLOB["AES-256-GCM<br/>Ciphertext Blobs"]
     end
 
-    subgraph Local["Local Machine"]
-        OLLAMA["phi-4-mini<br/>via Ollama<br/>localhost:11434"]
-    end
-
     UI --> FHE_SDK
     UI --> AES
     UI --> E5
+    UI --> WEBLLM
     AES --> CRYPTO
     FHE_SDK -->|"InEuint64, InEaddress"| VAULT
     AES -->|"[iv｜ciphertext]"| BLOB
     VAULT -->|"FHE operations"| COFHE
-    UI -->|"decrypted text (local only)"| OLLAMA
     VAULT -.->|"CID reference"| BLOB
 
     style Browser fill:#1a1a2e,stroke:#6366f1,color:#fff
     style Ethereum fill:#1a1a2e,stroke:#8b5cf6,color:#fff
     style IPFS fill:#1a1a2e,stroke:#22c55e,color:#fff
-    style Local fill:#1a1a2e,stroke:#f59e0b,color:#fff
 ```
 
 ---
@@ -164,7 +160,7 @@ sequenceDiagram
     participant User
     participant Browser
     participant E5 as e5-small (WASM)
-    participant Ollama as phi-4-mini (Local)
+    participant WebLLM as Qwen2.5-1.5B (WebGPU)
     participant Sepolia as Ethereum Sepolia
 
     User->>Browser: "What is the payment amount?"
@@ -173,23 +169,23 @@ sequenceDiagram
     Browser->>E5: embed("query: What is the payment amount?")
     E5-->>Browser: queryVector (384-dim)
     Browser->>Browser: cosine similarity vs document chunks
-    Browser-->>Browser: top-5 relevant chunks
+    Browser-->>Browser: top-3 relevant chunks
 
-    Note over Browser,Ollama: Step 2: Local AI Inference
-    Browser->>Ollama: POST /api/chat {model: phi4-mini, context: chunks, query}
-    Note over Ollama: Temperature: 0.1<br/>Max tokens: 512<br/>System: "Answer from document only"
-    Ollama-->>Browser: "The payment amount is $50,000..."
-    Note over Ollama: Sees plaintext (local only)<br/>Never transmitted externally
+    Note over Browser,WebLLM: Step 2: Browser LLM Inference
+    Browser->>WebLLM: inference via @mlc-ai/web-llm (WebGPU)
+    Note over WebLLM: Temperature: 0.1<br/>Max tokens: 300<br/>System: "Document analyst, answer from context only"
+    WebLLM-->>Browser: "The payment amount is $50,000..."
+    Note over WebLLM: Sees plaintext (browser tab only)<br/>Never transmitted externally
 
-    Note over Browser,Sepolia: Step 3: On-Chain Audit
+    Browser-->>User: "The payment amount is $50,000..."
+
+    Note over Browser,Sepolia: Step 3: On-Chain Audit (runs AFTER inference, non-blocking)
     Browser->>Browser: queryHash = keccak256(query + timestamp)
     Browser->>Sepolia: logQueryAuth(docId, queryHash)
     Sepolia->>Sepolia: wasAuth = FHE.gt(expiry, now)
     Sepolia->>Sepolia: _queryAudit[docId][queryHash] = wasAuth
     Sepolia-->>Browser: QueryLogged event + ebool
     Note over Sepolia: Stored: hash + encrypted authorization<br/>Proves query happened, authorized<br/>Content completely hidden
-
-    Browser-->>User: "The payment amount is $50,000..."
 ```
 
 ---
@@ -211,7 +207,7 @@ graph TD
     end
 
     subgraph Index["Document Indexing (lib/embeddings.ts)"]
-        C1["chunkText(): Split into 400-char chunks<br/>50-char overlap, skip fragments < 20 chars"]
+        C1["chunkText(): Structure-aware splitting<br/>paragraph → sentence → character cascade<br/>~300-char target, heading metadata"]
         C1 --> C2["For each chunk: embedPassage('passage: ' + text)<br/>e5-small WASM → 384-dim Float32Array"]
         C2 --> C3["Store DocumentChunk[] in React state<br/>(Wave 3: persist in IndexedDB)"]
     end
@@ -219,11 +215,20 @@ graph TD
     subgraph Query["User Asks Question (AIQueryBox.tsx)"]
         D1["embedQuery('query: ' + question)<br/>→ 384-dim vector"]
         D1 --> D2["Cosine similarity vs ALL chunk vectors"]
-        D2 --> D3["Filter score ≥ 0.5 threshold"]
-        D3 --> D4["Top-5 chunks → context string"]
+        D2 --> D3["Filter score ≥ 0.6 threshold"]
+        D3 --> D4["Top-3 chunks + adjacent context"]
         D4 --> D5{"Semantic search found results?"}
-        D5 -->|"Yes"| D6["Join top-5 with '---' separators"]
-        D5 -->|"No"| D7["Fallback: first 2000 chars"]
+        D5 -->|"Yes"| D6["assembleContext(): heading prefix,<br/>document order, 3000-char budget"]
+        D5 -->|"No"| D7["Fallback: first 3000 chars"]
+    end
+
+    subgraph Inference["Browser AI Inference (Qwen2.5-1.5B)"]
+        F1["@mlc-ai/web-llm (WebGPU)"]
+        F1 --> F2["System: 'Document analyst, answer from context only'"]
+        F2 --> F3["Context: assembled chunks (max 3000 chars)"]
+        F3 --> F4["Temperature: 0.1 · Max tokens: 300 · 4096 context window"]
+        F4 --> F5["Qwen2.5-1.5B generates answer"]
+        F5 --> F6["Answer displayed in chat UI"]
     end
 
     subgraph Audit["On-Chain Audit (FHE)"]
@@ -233,20 +238,11 @@ graph TD
         E3 --> E4["Store: _queryAudit[docId][hash] = wasAuthorized"]
     end
 
-    subgraph Inference["Local AI Inference (phi-4-mini)"]
-        F1["POST localhost:11434/api/chat"]
-        F1 --> F2["System: 'Answer ONLY from document excerpt'"]
-        F2 --> F3["Context: top-5 chunks (max 4000 chars)"]
-        F3 --> F4["Temperature: 0.1 · Max tokens: 512"]
-        F4 --> F5["phi-4-mini generates answer"]
-        F5 --> F6["Answer displayed in chat UI"]
-    end
-
     B4 --> C1
     C3 --> D1
-    D6 --> E1
-    D7 --> E1
-    E1 --> F1
+    D6 --> F1
+    D7 --> F1
+    F6 --> E1
 
     style Upload fill:#3b82f6,stroke:#2563eb,color:#fff
     style Open fill:#22c55e,stroke:#16a34a,color:#fff
@@ -258,16 +254,18 @@ graph TD
 
 ### Current AI Pipeline State
 
-| Component | Status | What It Does | Limitation |
+| Component | Status | What It Does | Notes |
 |---|---|---|---|
-| **Chunking** | ✅ Working | 400-char fixed chunks with 50-char overlap | Splits mid-sentence (Wave 3: paragraph-aware) |
-| **Embedding** | ✅ Working | e5-small WASM, 384-dim vectors, "passage:"/"query:" prefixes | Recomputes on page refresh (Wave 3: IndexedDB cache) |
-| **Vector Search** | ✅ Working | Cosine similarity, 0.5 threshold, top-5 results | No reranking (Wave 5: cross-encoder) |
-| **Context Assembly** | ✅ Working | Top-5 chunks joined, fallback to first 2000 chars | 4000 char limit |
-| **Conversation** | ⚠️ Stateless | Each question independent, no history | No follow-up context (Wave 3: message history) |
-| **On-Chain Audit** | ✅ Working | keccak256(query+ts) → FHE-encrypted authorization proof | Non-blocking (continues if tx fails) |
-| **LLM Inference** | ✅ Working | phi-4-mini via Ollama, T=0.1, 512 max tokens | Requires local Ollama (no bundled model) |
-| **Multi-Document** | ❌ Not Yet | Can only search within one document at a time | Wave 4: cross-document IndexedDB search |
+| **Chunking** | ✅ Working | Structure-aware: paragraph → sentence → character cascade, ~300-char target | Heading detection (markdown, ALL-CAPS, title-case), position metadata |
+| **Embedding** | ✅ Working | e5-small WASM, 384-dim vectors, heading-prefixed for better matching | "passage: Eligibility Requirements: You must be..." format |
+| **Vector Search** | ✅ Working | Cosine similarity, 0.6 threshold, top-3 results | Returns heading + position metadata for context assembly |
+| **Context Assembly** | ✅ Working | assembleContext(): top chunk + adjacent chunks, document order, heading prefix | 3000-char budget (browser) / 4000-char (Ollama fallback) |
+| **On-Chain Audit** | ✅ Available | keccak256(query+ts) → FHE-encrypted authorization proof | Disabled per-query (MetaMask UX); capability preserved for batch mode |
+| **LLM Inference** | ✅ Working | Qwen2.5-1.5B-Instruct via @mlc-ai/web-llm (WebGPU) | ~1.1GB cached in browser, 4096 token context, 20-60 tok/sec |
+| **Document Rendering** | ✅ Working | Multi-format: text (inline), PDF (iframe), images, binary (download) | File type detected via magic bytes |
+| **Conversation** | ⚠️ Stateless | Each question independent, no history | Wave 3: message history |
+| **Multi-Document** | ❌ Not Yet | Can only search within one document at a time | Wave 4: cross-document search |
+| **Multi-Format Parse** | ⚠️ Text Only | PDF/DOCX rendered but not parsed for AI Q&A | Wave 4: PDF text extraction, DOCX parsing |
 
 ---
 
@@ -409,12 +407,11 @@ graph TD
     DASH --> STATUS["EncryptionStatus<br/>8-layer privacy matrix"]
     DASH --> PILLS["StatusPill<br/>Wallet / Network / Contract / Docs"]
     
-    DOC --> AIBOX["AIQueryBox<br/>e5-small search + phi-4-mini Q&A + audit"]
+    DOC --> AIBOX["AIQueryBox<br/>e5-small search + Qwen2.5-1.5B Q&A (WebGPU)"]
     DOC --> ACCESS["AccessManager<br/>Grant / Revoke with FHE-encrypted expiry"]
     DOC --> STATUS2["EncryptionStatus"]
 
     PROVIDERS --> SDK["lib/cofhe-context.tsx<br/>@cofhe/sdk v0.4.0 direct"]
-    PROVIDERS --> API1["API: /api/analyze<br/>phi-4-mini proxy"]
     PROVIDERS --> API2["API: /api/contract-read<br/>Contract view calls"]
 
     style LAYOUT fill:#1e293b,stroke:#475569,color:#fff
@@ -434,7 +431,7 @@ graph BT
     L2["Layer 2: IPFS STORAGE<br/>Ciphertext blob on Pinata<br/>CID is public but useless without key"]
     L3["Layer 3: KEY MANAGEMENT<br/>Wallet signature → SHA-256 → AES wrapping key<br/>Only wallet holder can unwrap"]
     L4["Layer 4: ACCESS CONTROL<br/>FHE: eaddress + euint64 + ebool<br/>Even the access graph is encrypted"]
-    L5["Layer 5: AI ANALYSIS<br/>phi-4-mini (Ollama localhost)<br/>Document never leaves machine"]
+    L5["Layer 5: AI ANALYSIS<br/>Qwen2.5-1.5B (WebGPU in browser)<br/>Document never leaves browser tab"]
     L6["Layer 6: SEMANTIC SEARCH<br/>e5-small (WASM in browser)<br/>Vectors never transmitted"]
     L7["Layer 7: AUDIT TRAIL<br/>keccak256(query) + FHE ebool<br/>Proves authorization without revealing content"]
 
@@ -501,24 +498,28 @@ gantt
     Side-channel + Gas Limits   :done, w2g, 2026-04-10, 2026-04-13
     Drop @cofhe/react           :done, w2h, 2026-04-13, 2026-04-14
     
-    section Wave 3 — AI Pipeline + Ecosystem
-    IndexedDB Vector Store      :active, w3a, 2026-04-15, 2026-04-25
-    Conversation Memory         :w3b, 2026-04-18, 2026-04-28
-    Paragraph-Aware Chunking    :w3c, 2026-04-20, 2026-04-28
-    ECDH Key Re-encryption      :w3d, 2026-04-22, 2026-05-02
-    ReineiraOS IConditionResolver :w3e, 2026-04-28, 2026-05-08
+    section Wave 3 — AI Pipeline + Browser LLM
+    Browser LLM (Qwen2.5)      :done, w3a, 2026-04-15, 2026-04-19
+    Structure-Aware Chunking    :done, w3b, 2026-04-17, 2026-04-19
+    Multi-Format Rendering      :done, w3c, 2026-04-17, 2026-04-18
+    UI/UX Polish                :active, w3d, 2026-04-20, 2026-04-30
+    LLM Download Optimization   :w3e, 2026-04-22, 2026-05-01
+    Conversation Memory         :w3f, 2026-04-25, 2026-05-05
+    ECDH Key Re-encryption      :w3g, 2026-04-28, 2026-05-08
     
-    section Wave 4 — Multi-Document AI + Advanced FHE
-    Multi-Document Search       :w4a, 2026-05-11, 2026-05-17
-    FHE.select() + Analytics    :w4b, 2026-05-13, 2026-05-18
-    Cross-Chain Deployment      :w4c, 2026-05-15, 2026-05-20
-    Compliance Export           :w4d, 2026-05-17, 2026-05-20
+    section Wave 4 — Multi-Format AI + Advanced FHE
+    PDF Text Extraction         :w4a, 2026-05-11, 2026-05-17
+    DOCX/DOC Parsing            :w4b, 2026-05-12, 2026-05-18
+    Multi-Document Search       :w4c, 2026-05-14, 2026-05-20
+    FHE.select() + Analytics    :w4d, 2026-05-15, 2026-05-20
+    IndexedDB Vector Store      :w4e, 2026-05-16, 2026-05-20
     
-    section Wave 5 — Demo Day + Production
-    Cross-Encoder Reranker      :w5a, 2026-05-23, 2026-05-28
-    Streaming AI Responses      :w5b, 2026-05-25, 2026-05-30
-    Demo Video (5 min)          :w5c, 2026-05-28, 2026-06-01
-    Mainnet Readiness           :w5d, 2026-05-28, 2026-06-01
+    section Wave 5 — Production + Demo
+    Streaming AI Responses      :w5a, 2026-05-23, 2026-05-28
+    Web Worker Inference         :w5b, 2026-05-24, 2026-05-29
+    Compliance Export           :w5c, 2026-05-26, 2026-05-30
+    Demo Video (5 min)          :w5d, 2026-05-28, 2026-06-01
+    Mainnet Readiness           :w5e, 2026-05-28, 2026-06-01
 ```
 
 ---
@@ -584,14 +585,14 @@ graph TD
     subgraph Threats["Threat Vectors"]
         T1["Pinata breach:<br/>attacker gets IPFS blobs"]
         T2["Chain observer:<br/>reads all on-chain state"]
-        T3["Ollama compromise:<br/>local AI accessed"]
+        T3["Browser tab compromise:<br/>DevTools access to memory"]
         T4["Wallet theft:<br/>private key stolen"]
     end
 
     subgraph Mitigations["How Custos Mitigates"]
         M1["Blobs are AES-256-GCM ciphertext<br/>Useless without key"]
         M2["All sensitive state is FHE-encrypted<br/>Observer sees ciphertext hashes only"]
-        M3["Ollama is localhost-only<br/>No network exposure by default"]
+        M3["LLM runs in browser sandbox<br/>No network calls for inference<br/>Model cached in browser storage"]
         M4["Wallet theft = key theft<br/>Mitigate: hardware wallet + revocation"]
     end
 
